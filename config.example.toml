@@ -1,0 +1,7 @@
+# to run this, you need access to Gladia.
+# go to your Gladia dashboard. click "Account" on the left.
+# write something in the text box and click "Generate Key".
+# if the new key doesn't immediately appear in the list of keys, refresh.
+# the copy the API Key for the new key from the list and paste it here:
+gladia_api_key = ""
+# finally, copy this file to config.toml
