@@ -103,6 +103,7 @@ OPTIONS:
     -V, --version               Print version information
         --max-cost <DOLLARS>    Maximum cost before stopping (default: {max_cost})
         --parallel <N>          Concurrent transcriptions (default: {parallel})
+                                See: https://docs.gladia.io/chapters/limits-and-specifications/concurrency
         --segment-length <SEC>  Max segment length in seconds (default: {segment_length})
                                 See: https://docs.gladia.io/chapters/limits-and-specifications/supported-formats#gladia-api-current-limitations
         --dry-run               Estimate cost without transcribing
@@ -159,6 +160,25 @@ fn load_config() -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// Check that a required external tool is available in PATH.
+async fn check_external_tool(name: &str) -> anyhow::Result<()> {
+    match tokio::process::Command::new(name)
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "{name} not found in PATH. Please install ffmpeg: https://ffmpeg.org/download.html"
+            )
+        }
+        Err(e) => Err(e).with_context(|| format!("check for {name}")),
+    }
+}
+
 /// Get the API key, returning a helpful error if not configured.
 fn get_api_key(config: &Config) -> anyhow::Result<String> {
     config.gladia_api_key.clone().ok_or_else(|| {
@@ -206,6 +226,10 @@ async fn main() -> anyhow::Result<()> {
     if args.files.is_empty() {
         anyhow::bail!("no video files specified. Run with --help for usage.");
     }
+
+    // Check for required external tools
+    check_external_tool("ffmpeg").await?;
+    check_external_tool("ffprobe").await?;
 
     let config = load_config()?;
     let gladia_api_key = get_api_key(&config)?;
@@ -497,8 +521,7 @@ async fn main() -> anyhow::Result<()> {
                         // we got an error response, so print all we can
                         // if res is a 2XX but ffmpeg failed, we'll also land here
                         // but that's probably appropriate
-                        let ffmpeg =
-                            std::str::from_utf8(&ffmpeg.stderr).expect("ffmpeg stderr is utf-8");
+                        let ffmpeg = String::from_utf8_lossy(&ffmpeg.stderr);
                         let code = res.status();
                         let gladia = res
                             .text()
@@ -511,8 +534,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     (Err(e), _) => {
                         // the request couldn't even be issued. probably an I/O error.
-                        let ffmpeg =
-                            std::str::from_utf8(&ffmpeg.stderr).expect("ffmpeg stderr is utf-8");
+                        let ffmpeg = String::from_utf8_lossy(&ffmpeg.stderr);
                         Err(e)
                             .with_context(|| format!("ffmpeg output:\n{ffmpeg}"))
                             .context("issue transcribe request")?
@@ -520,7 +542,17 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let res: serde_json::Value = res.json().await.context("parse json")?;
-                let mut res: GladiaTranscribeResponse = serde_json::from_value(res).unwrap();
+                let mut res: GladiaTranscribeResponse = serde_json::from_value(res)
+                    .context("parse Gladia response")?;
+
+                // Gladia should always return at least one caption for non-silent audio
+                if res.prediction.is_empty() {
+                    anyhow::bail!(
+                        "Gladia returned no captions for segment starting at {}. \
+                         This may indicate silent audio or an API issue.",
+                        format_srt_timestamp(start.as_secs_f64())
+                    );
+                }
 
                 // If we're not at the last segment, find a good place to split.
                 // The end point may be in the middle of a sentence, so we look for
@@ -530,7 +562,7 @@ async fn main() -> anyhow::Result<()> {
                     let mut next_starts = res
                         .prediction
                         .last()
-                        .expect("always at least one caption")
+                        .expect("checked non-empty above")
                         .time_end;
                     let mut best_gap: Option<(usize, f64, f64)> = None;
                     for i in 0..res.prediction.len().min(20) {
@@ -617,7 +649,7 @@ async fn main() -> anyhow::Result<()> {
         };
         tasks.spawn(async move {
             fut.await
-                .with_context(|| format!("while transcribing '{}'", video_name))
+                .with_context(|| format!("while transcribing {}", video_name))
         });
     }
 
