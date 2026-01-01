@@ -1,7 +1,24 @@
-# to run this, you need access to Gladia.
-# go to your Gladia dashboard. click "Account" on the left.
-# write something in the text box and click "Generate Key".
-# if the new key doesn't immediately appear in the list of keys, refresh.
-# the copy the API Key for the new key from the list and paste it here:
+# Sirtea configuration file
+#
+# Copy this file to one of:
+#   Linux:   ~/.config/sirtea/config.toml
+#   macOS:   ~/Library/Application Support/sirtea/config.toml
+#   Windows: C:\Users\<user>\AppData\Roaming\sirtea\config.toml
+#
+# Or set the GLADIA_API_KEY environment variable instead.
+
+# Required: Your Gladia API key
+# Get one at https://app.gladia.io/ -> Account -> Generate Key
 gladia_api_key = ""
-# finally, copy this file to config.toml
+
+# Optional: Maximum cost before stopping transcription (in dollars)
+# Default: 10.0
+# max_cost = 10.0
+
+# Optional: Number of concurrent transcriptions
+# Default: 3
+# parallel = 3
+
+# Optional: Maximum segment length in seconds before splitting
+# Default: 3300 (55 minutes)
+# segment_length = 3300

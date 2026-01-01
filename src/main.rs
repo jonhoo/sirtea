@@ -124,9 +124,53 @@ REQUIREMENTS:
     );
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct Config {
-    gladia_api_key: String,
+    gladia_api_key: Option<String>,
+    // Optional settings that can be overridden by CLI flags
+    max_cost: Option<f64>,
+    parallel: Option<usize>,
+    segment_length: Option<f64>,
+}
+
+fn config_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "sirtea").map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+/// Load configuration from the appropriate location.
+/// Priority: env var (for API key) > config file
+fn load_config() -> anyhow::Result<Config> {
+    let mut config = Config::default();
+
+    if let Some(config_path) = config_dir().map(|d| d.join("config.toml")) {
+        if config_path.exists() {
+            let contents = std::fs::read_to_string(&config_path)
+                .with_context(|| format!("read config from '{}'", config_path.display()))?;
+            config = toml::from_str(&contents)
+                .with_context(|| format!("parse config from '{}'", config_path.display()))?;
+        }
+    }
+
+    // Environment variable takes precedence for API key
+    if let Ok(key) = std::env::var("GLADIA_API_KEY") {
+        config.gladia_api_key = Some(key);
+    }
+
+    Ok(config)
+}
+
+/// Get the API key, returning a helpful error if not configured.
+fn get_api_key(config: &Config) -> anyhow::Result<String> {
+    config.gladia_api_key.clone().ok_or_else(|| {
+        let config_path = config_dir()
+            .map(|d| d.join("config.toml").display().to_string())
+            .unwrap_or_else(|| "~/.config/sirtea/config.toml".to_string());
+
+        anyhow::anyhow!(
+            "No Gladia API key found. Set GLADIA_API_KEY environment variable \
+             or add gladia_api_key to {}", config_path
+        )
+    })
 }
 
 #[derive(Deserialize, Debug)]
@@ -163,15 +207,20 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no video files specified. Run with --help for usage.");
     }
 
-    let config = tokio::fs::read_to_string("config.toml")
-        .await
-        .context("read config")?;
-    let config: Config = toml::from_str(&config).context("parse config")?;
+    let config = load_config()?;
+    let gladia_api_key = get_api_key(&config)?;
 
-    // Resolve configuration: CLI > defaults
-    let max_cost = args.max_cost.unwrap_or(DEFAULT_MAX_COST);
-    let parallel = args.parallel.unwrap_or(DEFAULT_CONCURRENT_TRANSCRIBES);
-    let segment_length = args.segment_length.unwrap_or(DEFAULT_MAX_SEGMENT_LENGTH);
+    // Merge config with CLI args (CLI takes precedence, then config, then defaults)
+    let max_cost = args
+        .max_cost
+        .or(config.max_cost)
+        .unwrap_or(DEFAULT_MAX_COST);
+    let parallel = args.parallel
+        .or(config.parallel)
+        .unwrap_or(DEFAULT_CONCURRENT_TRANSCRIBES);
+    let segment_length = args.segment_length
+        .or(config.segment_length)
+        .unwrap_or(DEFAULT_MAX_SEGMENT_LENGTH);
 
     let client = reqwest::Client::new();
 
@@ -292,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
             .to_string();
         let cost_in_cents = Arc::clone(&cost_in_cents);
         let client = client.clone();
-        let gladia_api_key = config.gladia_api_key.clone();
+        let gladia_api_key = gladia_api_key.clone();
         let quiet = args.quiet;
         let fut = async move {
             let _permit = semaphore.acquire().await;
