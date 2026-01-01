@@ -2,6 +2,7 @@
 // TODO: Support alternative transcription backends (currently only Gladia)
 
 use anyhow::Context;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -248,9 +249,6 @@ async fn main() -> anyhow::Result<()> {
 
     let client = reqwest::Client::new();
 
-    if !args.quiet {
-        println!("==> finding video files locally");
-    }
     let mut videos = BTreeSet::new();
     for arg in &args.files {
         let path = arg.clone();
@@ -332,9 +330,6 @@ async fn main() -> anyhow::Result<()> {
             delay,
         });
     }
-    if !args.quiet {
-        println!(" -> found {} videos", videos.len());
-    }
 
     // Handle dry-run mode: estimate cost and exit
     if args.dry_run {
@@ -349,9 +344,21 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !args.quiet {
-        println!("==> transcribing videos with Gladia");
-    }
+    // Set up progress tracking
+    let multi_progress = if args.quiet {
+        None
+    } else {
+        Some(MultiProgress::new())
+    };
+    let waiting_style =
+        ProgressStyle::with_template("{prefix:.dim} {wide_msg:.dim}").expect("valid template");
+    let skipped_style =
+        ProgressStyle::with_template("{prefix:.yellow} {wide_msg:.dim}").expect("valid template");
+    let active_style =
+        ProgressStyle::with_template("{prefix:.bold.green} {spinner:.green} {wide_msg}")
+            .expect("valid template")
+            .tick_chars("╶─╺━╺─");
+
     let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
     let cost_in_cents = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut tasks = tokio::task::JoinSet::new();
@@ -359,27 +366,39 @@ async fn main() -> anyhow::Result<()> {
         let semaphore = Arc::clone(&semaphore);
         let video_name = video
             .path
-            .file_stem()
+            .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("video")
+            .unwrap_or("output")
             .to_string();
         let cost_in_cents = Arc::clone(&cost_in_cents);
         let client = client.clone();
         let gladia_api_key = gladia_api_key.clone();
-        let quiet = args.quiet;
+
+        // Create progress bar for this video (initially paused until semaphore acquired)
+        let progress_bar = multi_progress.as_ref().map(|mp| {
+            let pb = mp.add(ProgressBar::new_spinner());
+            pb.set_style(waiting_style.clone());
+            pb.set_prefix(format!("{} ⏸", video_name));
+            pb.set_message("waiting…");
+            pb
+        });
+
+        // Clone for use inside the async block (video_name is also used in error context)
+        let video_name_inner = video_name.clone();
+        let skipped_style = skipped_style.clone();
+        let active_style = active_style.clone();
         let fut = async move {
-            let _permit = semaphore.acquire().await;
+            let _permit = semaphore.acquire().await.expect("semaphore is not closed");
 
             let srt = video.path.with_extension("srt");
             if tokio::fs::try_exists(&srt)
                 .await
                 .context("check for existence")?
             {
-                if !quiet {
-                    println!(
-                        " -> not transcribing '{}' (.srt already exists)",
-                        video.path.display()
-                    );
+                if let Some(ref pb) = progress_bar {
+                    pb.set_style(skipped_style.clone());
+                    pb.set_prefix(video_name_inner.clone());
+                    pb.finish_with_message("skipped (exists)");
                 }
                 return Ok(());
             }
@@ -391,31 +410,30 @@ async fn main() -> anyhow::Result<()> {
             if accumulated_cost > max_cost {
                 // decrement again in case a shorter video comes along
                 cost_in_cents.fetch_sub(video_cost_in_cents, Ordering::AcqRel);
-                if !quiet {
-                    println!(
-                        " -> not transcribing '{}' (would exceed cost limit)",
-                        video.path.display()
-                    );
+                if let Some(ref pb) = progress_bar {
+                    pb.set_style(skipped_style);
+                    pb.set_prefix(video_name_inner.clone());
+                    pb.finish_with_message("skipped (cost limit)");
                 }
                 return Ok(());
             }
 
-            if !quiet {
-                println!(
-                    " -> transcribing '{}'",
-                    video.path.display(),
-                );
+            // We're not skipping, so switch to active style
+            if let Some(ref pb) = progress_bar {
+                pb.set_style(active_style);
+                pb.enable_steady_tick(Duration::from_millis(120));
             }
 
-            // Gladia has duration limits per request; see:
-            // https://docs.gladia.io/chapters/limits-and-specifications/supported-formats
+            // Split long videos into segments to stay under Gladia's duration limit.
+            // See: https://docs.gladia.io/chapters/limits-and-specifications/supported-formats#gladia-api-current-limitations
             let segment_count = (video.length.as_secs_f64() / segment_length).ceil() as u64;
+
             let mut start = Duration::default();
             let segment_duration = video.length.as_secs() / segment_count;
             let mut captions = Vec::new();
+            // Track info about the previous split point for status messages
+            let mut prev_split_info: Option<(f64, String)> = None;
             for split in 0..segment_count {
-                // For all segments except the last, compute the duration limit.
-                // The last segment has no limit since we want to capture all remaining audio.
                 let duration_limit = if split < segment_count - 1 {
                     Some(if split == 0 {
                         segment_duration - video.delay.as_secs()
@@ -423,8 +441,29 @@ async fn main() -> anyhow::Result<()> {
                         segment_duration
                     })
                 } else {
+                    // Last segment: extract to end of file
                     None
                 };
+
+                // Update progress bar with current segment and action
+                if let Some(ref pb) = progress_bar {
+                    pb.set_prefix(format!(
+                        "{} [{}/{}]",
+                        video_name_inner,
+                        split + 1,
+                        segment_count
+                    ));
+                    let msg = if segment_count == 1 {
+                        "uploading audio to Gladia".to_string()
+                    } else if let Some((gap_secs, ref phrase)) = prev_split_info {
+                        format!(
+                            "uploading audio segment following {gap_secs:.1}s gap after '{phrase}'"
+                        )
+                    } else {
+                        "uploading initial audio segment".to_string()
+                    };
+                    pb.set_message(msg);
+                }
 
                 let mut ffmpeg = tokio::process::Command::new("ffmpeg");
 
@@ -462,27 +501,6 @@ async fn main() -> anyhow::Result<()> {
 
                 if let Some(duration_limit) = duration_limit {
                     ffmpeg.arg("-t").arg(duration_limit.to_string());
-                }
-
-                // eprintln!("{ffmpeg:?}");
-
-                // if split >= 3 {
-                //     println!(" .. {} | exit early", video.youtube.id);
-                //     break;
-                // }
-
-                if !quiet {
-                    println!(
-                        " .. '{}' | {} -> {}",
-                        video.path.display(),
-                        format_srt_timestamp(start.as_secs_f64()),
-                        format_srt_timestamp(
-                            duration_limit
-                                .map(|d| start + Duration::from_secs(d))
-                                .unwrap_or(video.length)
-                                .as_secs_f64()
-                        )
-                    );
                 }
 
                 let mut ffmpeg = ffmpeg
@@ -554,11 +572,15 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                // If we're not at the last segment, find a good place to split.
-                // The end point may be in the middle of a sentence, so we look for
-                // the largest gap in the last 20 captions, preferring natural sentence
-                // boundaries. We then truncate at that gap and resume from there.
+                // if we're not at the last segment, we need to find a good place to split
                 if split < segment_count - 1 {
+                    if let Some(ref pb) = progress_bar {
+                        pb.set_message("finding split point");
+                    }
+                    // Here's the trick: we grabbed captions for [start..start + segment_duration]
+                    // but the end point may be in the middle of a caption! So we find the time of
+                    // last "gap", drop all captions following that, and resume captioning from
+                    // that point rather than from start. This finds natural sentence boundaries.
                     let mut next_starts = res
                         .prediction
                         .last()
@@ -599,15 +621,10 @@ async fn main() -> anyhow::Result<()> {
                     let gap = best_gap.expect("always a gap");
                     let slice_at = start
                         + Duration::from_secs_f64(res.prediction[gap.0].time_end + gap.1 / 2.0);
-                    if !quiet {
-                        println!(
-                            " .. '{}' | slicing at {} in {:?} gap after: {}",
-                            video.path.display(),
-                            format_srt_timestamp(slice_at.as_secs_f64()),
-                            Duration::from_secs_f64(gap.1),
-                            res.prediction[gap.0].transcription
-                        );
-                    }
+
+                    // Store split info for the next segment's status messages
+                    prev_split_info = Some((gap.1, res.prediction[gap.0].transcription.clone()));
+
                     res.prediction.truncate(gap.0 + 1);
                     start = slice_at;
                 }
@@ -622,9 +639,7 @@ async fn main() -> anyhow::Result<()> {
                 }));
             }
 
-            if !quiet {
-                println!(" .. '{}' | writing .srt", video.path.display());
-            }
+            // Write the SRT file
             let mut outfile = tokio::fs::File::create(&srt).await.context("create srt")?;
             for (i, segment) in captions.into_iter().enumerate() {
                 let line = format!(
@@ -642,8 +657,9 @@ async fn main() -> anyhow::Result<()> {
             }
             outfile.flush().await.context("flush srt")?;
 
-            if !quiet {
-                println!(" .. '{}' | done", video.path.display());
+            // Mark as complete
+            if let Some(ref pb) = progress_bar {
+                pb.finish_with_message("done");
             }
             Ok(())
         };
@@ -655,10 +671,7 @@ async fn main() -> anyhow::Result<()> {
 
     while !tasks.is_empty() {
         let v = tasks.join_next().await.expect("!is_empty");
-        let _ = v.context("join failed")?.context("job failed")?;
-    }
-    if !args.quiet {
-        eprintln!("==> all transcription completed");
+        v.context("join failed")?.context("job failed")?;
     }
 
     Ok(())
