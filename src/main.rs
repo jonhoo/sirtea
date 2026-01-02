@@ -17,6 +17,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
+use walkdir::WalkDir;
 
 const DEFAULT_MAX_SEGMENT_LENGTH: f64 = 5400.0; // 1h30m
 const DEFAULT_CONCURRENT_TRANSCRIBES: usize = 3;
@@ -32,6 +33,7 @@ struct Args {
     segment_length: Option<f64>,
     dry_run: bool,
     quiet: bool,
+    one_file_system: bool,
 }
 
 fn parse_args() -> Result<Args, lexopt::Error> {
@@ -43,6 +45,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     let mut segment_length = None;
     let mut dry_run = false;
     let mut quiet = false;
+    let mut one_file_system = false;
 
     let mut parser = lexopt::Parser::from_env();
     while let Some(arg) = parser.next()? {
@@ -70,6 +73,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Short('q') | Long("quiet") => {
                 quiet = true;
             }
+            Short('x') | Long("one-file-system") => {
+                one_file_system = true;
+            }
             Value(val) => {
                 files.push(val.into());
             }
@@ -84,6 +90,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
         segment_length,
         dry_run,
         quiet,
+        one_file_system,
     })
 }
 
@@ -94,10 +101,10 @@ fn print_help() {
 Generate SRT subtitle files from video using the Gladia speech-to-text API.
 
 USAGE:
-    {name} [OPTIONS] <FILE>...
+    {name} [OPTIONS] <PATH>...
 
 ARGS:
-    <FILE>...    Video files to transcribe
+    <PATH>...    Video files or directories to transcribe
 
 OPTIONS:
     -h, --help                  Print help information
@@ -109,6 +116,7 @@ OPTIONS:
                                 See: https://docs.gladia.io/chapters/limits-and-specifications/supported-formats#gladia-api-current-limitations
         --dry-run               Estimate cost without transcribing
     -q, --quiet                 Minimal output (errors only)
+    -x, --one-file-system       Don't cross filesystem boundaries when recursing directories
 
 CONFIGURATION:
     Set GLADIA_API_KEY environment variable or create a config file at
@@ -288,23 +296,59 @@ async fn main() -> anyhow::Result<()> {
 
     let client = reqwest::Client::new();
 
-    let mut videos = BTreeSet::new();
+    // Collect all candidate file paths, expanding directories with WalkDir.
+    // Track whether each path was explicitly specified (should error on failure)
+    // or discovered via directory walk (should silently skip non-media files).
+    let mut candidate_paths: Vec<(PathBuf, bool)> = Vec::new();
     for arg in &args.files {
-        let path = arg.clone();
-        anyhow::ensure!(path.exists(), "file '{}' does not exist", path.display());
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let src = std::fs::File::open(&path).context("failed to open media")?;
+        anyhow::ensure!(arg.exists(), "path '{}' does not exist", arg.display());
+
+        if arg.is_dir() {
+            let walker = WalkDir::new(arg).same_file_system(args.one_file_system);
+            for entry in walker {
+                let entry = entry.with_context(|| format!("walk directory '{}'", arg.display()))?;
+                if entry.file_type().is_file() {
+                    candidate_paths.push((entry.into_path(), false));
+                }
+            }
+        } else {
+            candidate_paths.push((arg.clone(), true));
+        }
+    }
+
+    let mut videos = BTreeSet::new();
+    for (path, explicit) in candidate_paths {
+        // Get extension for format detection
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        let src = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if explicit => {
+                anyhow::bail!("failed to open '{}': {}", path.display(), e);
+            }
+            Err(e) => {
+                if !args.quiet {
+                    eprintln!("warning: skipping '{}': {}", path.display(), e);
+                }
+                continue;
+            }
+        };
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
         let mut hint = Hint::new();
         hint.with_extension(ext);
         let meta_opts: MetadataOptions = Default::default();
         let fmt_opts: FormatOptions = Default::default();
-        let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &fmt_opts, &meta_opts)
-            .context("unsupported format")?;
+        let probed = match symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)
+        {
+            Ok(p) => p,
+            Err(e) if explicit => {
+                anyhow::bail!("unsupported format for '{}': {}", path.display(), e);
+            }
+            Err(_) => {
+                // Not a recognized media format - silently skip when walking directories
+                continue;
+            }
+        };
         let Some(track) = probed
             .format
             .tracks()
