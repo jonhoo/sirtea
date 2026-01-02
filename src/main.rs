@@ -45,6 +45,7 @@ struct Prediction {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LocalVideo {
     // NOTE: the order of the fields matter for Ord here
+    // We order by length first so shorter videos are processed first
     length: Duration,
     recorded: DateTime<Utc>,
     path: PathBuf,
@@ -61,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
 
     println!("==> finding video files locally");
-    let mut local_videos = BTreeSet::new();
+    let mut videos = BTreeSet::new();
     for arg in std::env::args().skip(1) {
         let path = std::path::PathBuf::from(arg);
         anyhow::ensure!(path.exists(), "file '{}' does not exist", path.display());
@@ -132,27 +133,27 @@ async fn main() -> anyhow::Result<()> {
         } else {
             Duration::from_secs_f64(delay)
         };
-        local_videos.insert(LocalVideo {
+        videos.insert(LocalVideo {
             recorded: dt,
             length,
             path,
             delay,
         });
     }
-    println!(" -> found {} videos", local_videos.len());
+    println!(" -> found {} videos", videos.len());
 
     println!("==> transcribing videos with Gladia");
-    let s = Arc::new(tokio::sync::Semaphore::new(CONCURRENT_TRANSCRIBES));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(CONCURRENT_TRANSCRIBES));
     let cost_in_cents = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut tasks = tokio::task::JoinSet::new();
-    for video in local_videos {
-        let s = Arc::clone(&s);
+    for video in videos {
+        let semaphore = Arc::clone(&semaphore);
         let date = video.recorded;
         let cost_in_cents = Arc::clone(&cost_in_cents);
         let client = client.clone();
         let gladia_api_key = config.gladia_api_key.clone();
         let fut = async move {
-            let _permit = s.acquire().await;
+            let _permit = semaphore.acquire().await;
 
             let srt = format!("{}.srt", video.recorded.date_naive());
             if tokio::fs::try_exists(&srt)
@@ -166,13 +167,13 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let this_in_cents =
+            let video_cost_in_cents =
                 (100.0 * PRICE_PER_SECOND * video.length.as_secs_f64()).round() as u64;
-            let total_cost =
-                cost_in_cents.fetch_add(this_in_cents, Ordering::AcqRel) as f64 / 100.0;
-            if total_cost > MAX_PRICE {
+            let accumulated_cost =
+                cost_in_cents.fetch_add(video_cost_in_cents, Ordering::AcqRel) as f64 / 100.0;
+            if accumulated_cost > MAX_PRICE {
                 // decrement again in case a shorter video comes along
-                cost_in_cents.fetch_sub(this_in_cents, Ordering::AcqRel);
+                cost_in_cents.fetch_sub(video_cost_in_cents, Ordering::AcqRel);
                 println!(
                     " -> not transcribing '{}' (would exceed cost limit)",
                     video.path.display()
@@ -186,18 +187,20 @@ async fn main() -> anyhow::Result<()> {
                 video.path.display(),
             );
 
-            // https://gladia-stt.nolt.io/23
-            // https://gladia-stt.nolt.io/24
-            let nsplits = (video.length.as_secs_f64() / MAX_SEGMENT_LENGTH).ceil() as u64;
+            // Gladia has duration limits per request; see:
+            // https://docs.gladia.io/chapters/limits-and-specifications/supported-formats
+            let segment_count = (video.length.as_secs_f64() / MAX_SEGMENT_LENGTH).ceil() as u64;
             let mut start = Duration::default();
-            let dur = video.length.as_secs() / nsplits;
+            let segment_duration = video.length.as_secs() / segment_count;
             let mut captions = Vec::new();
-            for split in 0..nsplits {
-                let t = if split < nsplits - 1 {
+            for split in 0..segment_count {
+                // For all segments except the last, compute the duration limit.
+                // The last segment has no limit since we want to capture all remaining audio.
+                let duration_limit = if split < segment_count - 1 {
                     Some(if split == 0 {
-                        dur - video.delay.as_secs()
+                        segment_duration - video.delay.as_secs()
                     } else {
-                        dur
+                        segment_duration
                     })
                 } else {
                     None
@@ -237,8 +240,8 @@ async fn main() -> anyhow::Result<()> {
                         .arg(format!("adelay={}", video.delay.as_millis()));
                 }
 
-                if let Some(t) = t {
-                    ffmpeg.arg("-t").arg(t.to_string());
+                if let Some(duration_limit) = duration_limit {
+                    ffmpeg.arg("-t").arg(duration_limit.to_string());
                 }
 
                 // eprintln!("{ffmpeg:?}");
@@ -251,9 +254,10 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     " .. {} | {} -> {}",
                     video.recorded.date_naive(),
-                    seconds_to_timestamp(start.as_secs_f64()),
-                    seconds_to_timestamp(
-                        t.map(|t| start + Duration::from_secs(t))
+                    format_srt_timestamp(start.as_secs_f64()),
+                    format_srt_timestamp(
+                        duration_limit
+                            .map(|d| start + Duration::from_secs(d))
                             .unwrap_or(video.length)
                             .as_secs_f64()
                     )
@@ -320,14 +324,11 @@ async fn main() -> anyhow::Result<()> {
                 let res: serde_json::Value = res.json().await.context("parse json")?;
                 let mut res: GladiaTranscribeResponse = serde_json::from_value(res).unwrap();
 
-                // if we're not at the last segment, we need to find a good place to split
-                if split < nsplits - 1 {
-                    // here comes the trick
-                    // we grabbed captions for [start..start + dur]
-                    // _but_ the end point may be in the middle of a caption!
-                    // so, we find the time of last "gap"
-                    // drop all the captions following that
-                    // and resume captioning from that point rather than start
+                // If we're not at the last segment, find a good place to split.
+                // The end point may be in the middle of a sentence, so we look for
+                // the largest gap in the last 20 captions, preferring natural sentence
+                // boundaries. We then truncate at that gap and resume from there.
+                if split < segment_count - 1 {
                     let mut next_starts = res
                         .prediction
                         .last()
@@ -348,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
                             1.3 * gap
                         } else if res.prediction[i]
                             .transcription
-                            .ends_with(|c| c == '.' || c == '?' || c == '!' || c == ':')
+                            .ends_with(['.', '?', '!', ':'])
                         {
                             2.0 * gap
                         } else {
@@ -371,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
                     println!(
                         " .. {} | slicing at {} in {:?} gap after: {}",
                         video.recorded.date_naive(),
-                        seconds_to_timestamp(slice_at.as_secs_f64()),
+                        format_srt_timestamp(slice_at.as_secs_f64()),
                         Duration::from_secs_f64(gap.1),
                         res.prediction[gap.0].transcription
                     );
@@ -396,8 +397,8 @@ async fn main() -> anyhow::Result<()> {
                     "{}{}\n{} --> {}\n{}\n",
                     if i != 0 { "\n" } else { "" },
                     i + 1,
-                    seconds_to_timestamp(segment.time_begin),
-                    seconds_to_timestamp(segment.time_end),
+                    format_srt_timestamp(segment.time_begin),
+                    format_srt_timestamp(segment.time_end),
                     segment.transcription,
                 );
                 outfile
@@ -425,28 +426,34 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn seconds_to_timestamp(fracs: f64) -> String {
-    let mut is = fracs as i64;
-    assert!(is >= 0);
-    let h = is / 3600;
-    is -= h * 3600;
-    let m = is / 60;
-    is -= m * 60;
-    let s = is;
-    let frac = fracs.fract();
-    let frac = format!("{:.3}", frac);
-    let frac = if let Some(frac) = frac.strip_prefix("0.") {
-        format!(",{frac}")
-    } else if frac == "1.000" {
+fn format_srt_timestamp(total_seconds: f64) -> String {
+    // Negative timestamps should never occur - they would indicate a bug
+    // in our timestamp calculation logic
+    let mut remaining_secs = total_seconds as i64;
+    debug_assert!(remaining_secs >= 0, "negative timestamp: {total_seconds}");
+    remaining_secs = remaining_secs.max(0); // Saturate to 0 in release builds rather than panic
+    let h = remaining_secs / 3600;
+    remaining_secs -= h * 3600;
+    let m = remaining_secs / 60;
+    remaining_secs -= m * 60;
+    let s = remaining_secs;
+    let millis_str = total_seconds.fract();
+    let millis_str = format!("{:.3}", millis_str);
+    let millis_str = if let Some(millis) = millis_str.strip_prefix("0.") {
+        format!(",{millis}")
+    } else if millis_str == "1.000" {
         // 0.9995 would be truncated to 1.000 at {:.3}
         String::from(",999")
-    } else if frac == "0" {
+    } else if millis_str == "0" {
         // integral number of seconds
         String::from(",000")
     } else {
-        unreachable!("bad fractional second: {} -> {frac}", fracs.fract())
+        unreachable!(
+            "bad fractional second: {} -> {millis_str}",
+            total_seconds.fract()
+        )
     };
-    format!("{h:02}:{m:02}:{s:02}{frac}")
+    format!("{h:02}:{m:02}:{s:02}{millis_str}")
 }
 
 #[cfg(test)]
@@ -455,11 +462,11 @@ mod tests {
 
     #[test]
     fn all_ones() {
-        assert!(dbg!(seconds_to_timestamp(3661.3)).starts_with("01:01:01,3"));
+        assert!(dbg!(format_srt_timestamp(3661.3)).starts_with("01:01:01,3"));
     }
 
     #[test]
     fn zero_fract() {
-        assert_eq!(seconds_to_timestamp(3661.0), "01:01:01");
+        assert_eq!(format_srt_timestamp(3661.0), "01:01:01,000");
     }
 }
