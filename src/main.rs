@@ -1,5 +1,4 @@
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -47,7 +46,6 @@ struct LocalVideo {
     // NOTE: the order of the fields matter for Ord here
     // We order by length first so shorter videos are processed first
     length: Duration,
-    recorded: DateTime<Utc>,
     path: PathBuf,
     delay: Duration,
 }
@@ -66,18 +64,10 @@ async fn main() -> anyhow::Result<()> {
     for arg in std::env::args().skip(1) {
         let path = std::path::PathBuf::from(arg);
         anyhow::ensure!(path.exists(), "file '{}' does not exist", path.display());
-        let Some(name) = path.file_name() else {
-            continue;
-        };
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some((name, ext)) = name.split_once('.') else {
-            continue;
-        };
-        let Ok(dt) = name.parse::<DateTime<Utc>>() else {
-            continue;
-        };
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
         let src = std::fs::File::open(&path).context("failed to open media")?;
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
         let mut hint = Hint::new();
@@ -134,7 +124,6 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs_f64(delay)
         };
         videos.insert(LocalVideo {
-            recorded: dt,
             length,
             path,
             delay,
@@ -148,14 +137,19 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for video in videos {
         let semaphore = Arc::clone(&semaphore);
-        let date = video.recorded;
+        let video_name = video
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video")
+            .to_string();
         let cost_in_cents = Arc::clone(&cost_in_cents);
         let client = client.clone();
         let gladia_api_key = config.gladia_api_key.clone();
         let fut = async move {
             let _permit = semaphore.acquire().await;
 
-            let srt = format!("{}.srt", video.recorded.date_naive());
+            let srt = video.path.with_extension("srt");
             if tokio::fs::try_exists(&srt)
                 .await
                 .context("check for existence")?
@@ -182,8 +176,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             println!(
-                " -> transcribing {} ({})",
-                video.recorded.date_naive(),
+                " -> transcribing '{}'",
                 video.path.display(),
             );
 
@@ -252,8 +245,8 @@ async fn main() -> anyhow::Result<()> {
                 // }
 
                 println!(
-                    " .. {} | {} -> {}",
-                    video.recorded.date_naive(),
+                    " .. '{}' | {} -> {}",
+                    video.path.display(),
                     format_srt_timestamp(start.as_secs_f64()),
                     format_srt_timestamp(
                         duration_limit
@@ -370,8 +363,8 @@ async fn main() -> anyhow::Result<()> {
                     let slice_at = start
                         + Duration::from_secs_f64(res.prediction[gap.0].time_end + gap.1 / 2.0);
                     println!(
-                        " .. {} | slicing at {} in {:?} gap after: {}",
-                        video.recorded.date_naive(),
+                        " .. '{}' | slicing at {} in {:?} gap after: {}",
+                        video.path.display(),
                         format_srt_timestamp(slice_at.as_secs_f64()),
                         Duration::from_secs_f64(gap.1),
                         res.prediction[gap.0].transcription
@@ -390,7 +383,7 @@ async fn main() -> anyhow::Result<()> {
                 }));
             }
 
-            println!(" .. {} | writing .srt", video.recorded.date_naive());
+            println!(" .. '{}' | writing .srt", video.path.display());
             let mut outfile = tokio::fs::File::create(&srt).await.context("create srt")?;
             for (i, segment) in captions.into_iter().enumerate() {
                 let line = format!(
@@ -408,12 +401,12 @@ async fn main() -> anyhow::Result<()> {
             }
             outfile.flush().await.context("flush srt")?;
 
-            println!(" .. {} | done", video.recorded.date_naive());
+            println!(" .. '{}' | done", video.path.display());
             Ok(())
         };
         tasks.spawn(async move {
             fut.await
-                .with_context(|| format!("while transcribing {}", date.date_naive()))
+                .with_context(|| format!("while transcribing '{}'", video_name))
         });
     }
 
