@@ -2,9 +2,11 @@
 name = "sirtea"
 version = "0.1.0"
 edition = "2021"
-
-[profile.release]
-debug = true
+description = "Generate SRT subtitle files from video using the Gladia speech-to-text API"
+repository = "https://github.com/jonhoo/sirtea"
+license = "MIT OR Apache-2.0"
+keywords = ["caption", "subtitle", "srt", "transcription", "speech-to-text"]
+categories = ["command-line-utilities", "multimedia::video"]
 
 [dependencies]
 anyhow = "1.0.75"
