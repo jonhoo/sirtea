@@ -18,10 +18,10 @@ use symphonia::core::probe::Hint;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-const DEFAULT_MAX_SEGMENT_LENGTH: f64 = 3300.0;
+const DEFAULT_MAX_SEGMENT_LENGTH: f64 = 5400.0; // 1h30m
 const DEFAULT_CONCURRENT_TRANSCRIBES: usize = 3;
 const DEFAULT_MAX_COST: f64 = 10.0;
-const PRICE_PER_SECOND: f64 = 0.000193;
+const PRICE_PER_SECOND: f64 = 0.0001694;
 
 /// Command-line arguments.
 struct Args {

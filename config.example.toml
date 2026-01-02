@@ -20,5 +20,5 @@ gladia_api_key = ""
 # parallel = 3
 
 # Optional: Maximum segment length in seconds before splitting
-# Default: 3300 (55 minutes)
-# segment_length = 3300
+# Default: 5400 (1h30m)
+# segment_length = 5400
