@@ -1,3 +1,6 @@
+// TODO: Add --srt / --vtt format selection (currently only SRT is supported)
+// TODO: Support alternative transcription backends (currently only Gladia)
+
 use anyhow::Context;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
