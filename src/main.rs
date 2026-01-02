@@ -197,7 +197,8 @@ fn get_api_key(config: &Config) -> anyhow::Result<String> {
 
         anyhow::anyhow!(
             "No Gladia API key found. Set GLADIA_API_KEY environment variable \
-             or add gladia_api_key to {}", config_path
+             or add gladia_api_key to {}",
+            config_path
         )
     })
 }
@@ -287,10 +288,12 @@ async fn main() -> anyhow::Result<()> {
         .max_cost
         .or(config.max_cost)
         .unwrap_or(DEFAULT_MAX_COST);
-    let parallel = args.parallel
+    let parallel = args
+        .parallel
         .or(config.parallel)
         .unwrap_or(DEFAULT_CONCURRENT_TRANSCRIBES);
-    let segment_length = args.segment_length
+    let segment_length = args
+        .segment_length
         .or(config.segment_length)
         .unwrap_or(DEFAULT_MAX_SEGMENT_LENGTH);
 
@@ -639,10 +642,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                let upload: UploadResponse = upload_res
-                    .json()
-                    .await
-                    .context("parse upload response")?;
+                let upload: UploadResponse =
+                    upload_res.json().await.context("parse upload response")?;
 
                 // Step 2: Initiate transcription
                 // See: https://docs.gladia.io/api-reference/v2/pre-recorded/init
@@ -716,9 +717,8 @@ async fn main() -> anyhow::Result<()> {
 
                     match status.status.as_str() {
                         "done" => {
-                            let result = status
-                                .result
-                                .context("transcription done but no result")?;
+                            let result =
+                                status.result.context("transcription done but no result")?;
                             break result.transcription.utterances;
                         }
                         "error" => {
@@ -758,10 +758,7 @@ async fn main() -> anyhow::Result<()> {
                     // but the end point may be in the middle of a caption! So we find the time of
                     // last "gap", drop all captions following that, and resume captioning from
                     // that point rather than from start. This finds natural sentence boundaries.
-                    let mut next_starts = utterances
-                        .last()
-                        .expect("checked non-empty above")
-                        .end;
+                    let mut next_starts = utterances.last().expect("checked non-empty above").end;
                     let mut best_gap: Option<(usize, f64, f64)> = None;
                     for i in 0..utterances.len().min(20) {
                         let i = utterances.len() - i - 1;
