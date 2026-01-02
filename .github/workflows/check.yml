@@ -1,0 +1,62 @@
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+name: check
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    name: stable / fmt
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
+        with:
+          submodules: true
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # branch=master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --check
+  clippy:
+    runs-on: ubuntu-latest
+    name: stable / clippy
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
+        with:
+          submodules: true
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # branch=master
+        with:
+          toolchain: stable
+          components: clippy
+      - name: cargo clippy
+        uses: giraffate/clippy-action@13b9d32482f25d29ead141b79e7e04e7900281e0 # tag=v1.0.1
+        with:
+          reporter: 'github-pr-check'
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+  compiles:
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / stable
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
+        with:
+          submodules: true
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # branch=master
+        with:
+          toolchain: stable
+      - name: cargo check
+        run: cargo check --locked --all-features --all-targets
