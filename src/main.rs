@@ -33,6 +33,7 @@ struct Args {
     segment_length: Option<f64>,
     dry_run: bool,
     quiet: bool,
+    verbose: bool,
     one_file_system: bool,
 }
 
@@ -45,6 +46,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     let mut segment_length = None;
     let mut dry_run = false;
     let mut quiet = false;
+    let mut verbose = false;
     let mut one_file_system = false;
 
     let mut parser = lexopt::Parser::from_env();
@@ -73,6 +75,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Short('q') | Long("quiet") => {
                 quiet = true;
             }
+            Short('v') | Long("verbose") => {
+                verbose = true;
+            }
             Short('x') | Long("one-file-system") => {
                 one_file_system = true;
             }
@@ -90,6 +95,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
         segment_length,
         dry_run,
         quiet,
+        verbose,
         one_file_system,
     })
 }
@@ -116,6 +122,7 @@ OPTIONS:
                                 See: https://docs.gladia.io/chapters/limits-and-specifications/supported-formats#gladia-api-current-limitations
         --dry-run               Estimate cost without transcribing
     -q, --quiet                 Minimal output (errors only)
+    -v, --verbose               Print split point details when segmenting long videos
     -x, --one-file-system       Don't cross filesystem boundaries when recursing directories
 
 CONFIGURATION:
@@ -473,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
         let video_name_inner = video_name.clone();
         let skipped_style = skipped_style.clone();
         let active_style = active_style.clone();
+        let verbose = args.verbose;
         let fut = async move {
             let _permit = semaphore.acquire().await.expect("semaphore is not closed");
 
@@ -791,6 +799,16 @@ async fn main() -> anyhow::Result<()> {
                     let gap = best_gap.expect("always a gap");
                     let slice_at =
                         start + Duration::from_secs_f64(utterances[gap.0].end + gap.1 / 2.0);
+
+                    if verbose {
+                        eprintln!(
+                            "{}: split at {} ({:.1}s gap after '{}')",
+                            video_name_inner,
+                            format_srt_timestamp(slice_at.as_secs_f64()),
+                            gap.1,
+                            utterances[gap.0].text,
+                        );
+                    }
 
                     // Store split info for the next segment's status messages
                     prev_split_info = Some((gap.1, utterances[gap.0].text.clone()));
