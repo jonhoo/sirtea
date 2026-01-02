@@ -17,10 +17,112 @@ use symphonia::core::probe::Hint;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-const MAX_SEGMENT_LENGTH: f64 = 3300.0;
-const CONCURRENT_TRANSCRIBES: usize = 3;
-const MAX_PRICE: f64 = 10.0;
+const DEFAULT_MAX_SEGMENT_LENGTH: f64 = 3300.0;
+const DEFAULT_CONCURRENT_TRANSCRIBES: usize = 3;
+const DEFAULT_MAX_COST: f64 = 10.0;
 const PRICE_PER_SECOND: f64 = 0.000193;
+
+/// Command-line arguments.
+struct Args {
+    files: Vec<PathBuf>,
+    /// None means "not explicitly set on command line"
+    max_cost: Option<f64>,
+    parallel: Option<usize>,
+    segment_length: Option<f64>,
+    dry_run: bool,
+    quiet: bool,
+}
+
+fn parse_args() -> Result<Args, lexopt::Error> {
+    use lexopt::prelude::*;
+
+    let mut files = Vec::new();
+    let mut max_cost = None;
+    let mut parallel = None;
+    let mut segment_length = None;
+    let mut dry_run = false;
+    let mut quiet = false;
+
+    let mut parser = lexopt::Parser::from_env();
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => {
+                print_help();
+                std::process::exit(0);
+            }
+            Short('V') | Long("version") => {
+                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            Long("max-cost") => {
+                max_cost = Some(parser.value()?.parse()?);
+            }
+            Long("parallel") => {
+                parallel = Some(parser.value()?.parse()?);
+            }
+            Long("segment-length") => {
+                segment_length = Some(parser.value()?.parse()?);
+            }
+            Long("dry-run") => {
+                dry_run = true;
+            }
+            Short('q') | Long("quiet") => {
+                quiet = true;
+            }
+            Value(val) => {
+                files.push(val.into());
+            }
+            _ => return Err(arg.unexpected()),
+        }
+    }
+
+    Ok(Args {
+        files,
+        max_cost,
+        parallel,
+        segment_length,
+        dry_run,
+        quiet,
+    })
+}
+
+fn print_help() {
+    println!(
+        "\
+{name} {version}
+Generate SRT subtitle files from video using the Gladia speech-to-text API.
+
+USAGE:
+    {name} [OPTIONS] <FILE>...
+
+ARGS:
+    <FILE>...    Video files to transcribe
+
+OPTIONS:
+    -h, --help                  Print help information
+    -V, --version               Print version information
+        --max-cost <DOLLARS>    Maximum cost before stopping (default: {max_cost})
+        --parallel <N>          Concurrent transcriptions (default: {parallel})
+        --segment-length <SEC>  Max segment length in seconds (default: {segment_length})
+                                See: https://docs.gladia.io/chapters/limits-and-specifications/supported-formats#gladia-api-current-limitations
+        --dry-run               Estimate cost without transcribing
+    -q, --quiet                 Minimal output (errors only)
+
+CONFIGURATION:
+    Set GLADIA_API_KEY environment variable or create a config file at
+    $XDG_CONFIG_HOME/sirtea/config.toml (usually ~/.config/sirtea/config.toml).
+
+REQUIREMENTS:
+    - ffmpeg and ffprobe in PATH (https://ffmpeg.org/download.html)
+    - Gladia API key (https://docs.gladia.io/chapters/introduction/getting-started)
+",
+        name = env!("CARGO_PKG_NAME"),
+        version = env!("CARGO_PKG_VERSION"),
+        max_cost = DEFAULT_MAX_COST,
+        parallel = DEFAULT_CONCURRENT_TRANSCRIBES,
+        segment_length = DEFAULT_MAX_SEGMENT_LENGTH,
+    );
+}
 
 #[derive(Deserialize)]
 struct Config {
@@ -55,17 +157,30 @@ struct LocalVideo {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = parse_args().context("parse arguments")?;
+
+    if args.files.is_empty() {
+        anyhow::bail!("no video files specified. Run with --help for usage.");
+    }
+
     let config = tokio::fs::read_to_string("config.toml")
         .await
         .context("read config")?;
     let config: Config = toml::from_str(&config).context("parse config")?;
 
+    // Resolve configuration: CLI > defaults
+    let max_cost = args.max_cost.unwrap_or(DEFAULT_MAX_COST);
+    let parallel = args.parallel.unwrap_or(DEFAULT_CONCURRENT_TRANSCRIBES);
+    let segment_length = args.segment_length.unwrap_or(DEFAULT_MAX_SEGMENT_LENGTH);
+
     let client = reqwest::Client::new();
 
-    println!("==> finding video files locally");
+    if !args.quiet {
+        println!("==> finding video files locally");
+    }
     let mut videos = BTreeSet::new();
-    for arg in std::env::args().skip(1) {
-        let path = std::path::PathBuf::from(arg);
+    for arg in &args.files {
+        let path = arg.clone();
         anyhow::ensure!(path.exists(), "file '{}' does not exist", path.display());
         let ext = path
             .extension()
@@ -144,10 +259,27 @@ async fn main() -> anyhow::Result<()> {
             delay,
         });
     }
-    println!(" -> found {} videos", videos.len());
+    if !args.quiet {
+        println!(" -> found {} videos", videos.len());
+    }
 
-    println!("==> transcribing videos with Gladia");
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(CONCURRENT_TRANSCRIBES));
+    // Handle dry-run mode: estimate cost and exit
+    if args.dry_run {
+        let total_seconds: f64 = videos.iter().map(|v| v.length.as_secs_f64()).sum();
+        let estimated_cost = total_seconds * PRICE_PER_SECOND;
+        println!(
+            "Dry run: {} video(s), {:.1} minutes total",
+            videos.len(),
+            total_seconds / 60.0
+        );
+        println!("Estimated cost: ${:.2}", estimated_cost);
+        return Ok(());
+    }
+
+    if !args.quiet {
+        println!("==> transcribing videos with Gladia");
+    }
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
     let cost_in_cents = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut tasks = tokio::task::JoinSet::new();
     for video in videos {
@@ -161,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
         let cost_in_cents = Arc::clone(&cost_in_cents);
         let client = client.clone();
         let gladia_api_key = config.gladia_api_key.clone();
+        let quiet = args.quiet;
         let fut = async move {
             let _permit = semaphore.acquire().await;
 
@@ -169,10 +302,12 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("check for existence")?
             {
-                println!(
-                    " -> not transcribing '{}' (.srt already exists)",
-                    video.path.display()
-                );
+                if !quiet {
+                    println!(
+                        " -> not transcribing '{}' (.srt already exists)",
+                        video.path.display()
+                    );
+                }
                 return Ok(());
             }
 
@@ -180,24 +315,28 @@ async fn main() -> anyhow::Result<()> {
                 (100.0 * PRICE_PER_SECOND * video.length.as_secs_f64()).round() as u64;
             let accumulated_cost =
                 cost_in_cents.fetch_add(video_cost_in_cents, Ordering::AcqRel) as f64 / 100.0;
-            if accumulated_cost > MAX_PRICE {
+            if accumulated_cost > max_cost {
                 // decrement again in case a shorter video comes along
                 cost_in_cents.fetch_sub(video_cost_in_cents, Ordering::AcqRel);
-                println!(
-                    " -> not transcribing '{}' (would exceed cost limit)",
-                    video.path.display()
-                );
+                if !quiet {
+                    println!(
+                        " -> not transcribing '{}' (would exceed cost limit)",
+                        video.path.display()
+                    );
+                }
                 return Ok(());
             }
 
-            println!(
-                " -> transcribing '{}'",
-                video.path.display(),
-            );
+            if !quiet {
+                println!(
+                    " -> transcribing '{}'",
+                    video.path.display(),
+                );
+            }
 
             // Gladia has duration limits per request; see:
             // https://docs.gladia.io/chapters/limits-and-specifications/supported-formats
-            let segment_count = (video.length.as_secs_f64() / MAX_SEGMENT_LENGTH).ceil() as u64;
+            let segment_count = (video.length.as_secs_f64() / segment_length).ceil() as u64;
             let mut start = Duration::default();
             let segment_duration = video.length.as_secs() / segment_count;
             let mut captions = Vec::new();
@@ -259,17 +398,19 @@ async fn main() -> anyhow::Result<()> {
                 //     break;
                 // }
 
-                println!(
-                    " .. '{}' | {} -> {}",
-                    video.path.display(),
-                    format_srt_timestamp(start.as_secs_f64()),
-                    format_srt_timestamp(
-                        duration_limit
-                            .map(|d| start + Duration::from_secs(d))
-                            .unwrap_or(video.length)
-                            .as_secs_f64()
-                    )
-                );
+                if !quiet {
+                    println!(
+                        " .. '{}' | {} -> {}",
+                        video.path.display(),
+                        format_srt_timestamp(start.as_secs_f64()),
+                        format_srt_timestamp(
+                            duration_limit
+                                .map(|d| start + Duration::from_secs(d))
+                                .unwrap_or(video.length)
+                                .as_secs_f64()
+                        )
+                    );
+                }
 
                 let mut ffmpeg = ffmpeg
                     .arg("-")
@@ -377,13 +518,15 @@ async fn main() -> anyhow::Result<()> {
                     let gap = best_gap.expect("always a gap");
                     let slice_at = start
                         + Duration::from_secs_f64(res.prediction[gap.0].time_end + gap.1 / 2.0);
-                    println!(
-                        " .. '{}' | slicing at {} in {:?} gap after: {}",
-                        video.path.display(),
-                        format_srt_timestamp(slice_at.as_secs_f64()),
-                        Duration::from_secs_f64(gap.1),
-                        res.prediction[gap.0].transcription
-                    );
+                    if !quiet {
+                        println!(
+                            " .. '{}' | slicing at {} in {:?} gap after: {}",
+                            video.path.display(),
+                            format_srt_timestamp(slice_at.as_secs_f64()),
+                            Duration::from_secs_f64(gap.1),
+                            res.prediction[gap.0].transcription
+                        );
+                    }
                     res.prediction.truncate(gap.0 + 1);
                     start = slice_at;
                 }
@@ -398,7 +541,9 @@ async fn main() -> anyhow::Result<()> {
                 }));
             }
 
-            println!(" .. '{}' | writing .srt", video.path.display());
+            if !quiet {
+                println!(" .. '{}' | writing .srt", video.path.display());
+            }
             let mut outfile = tokio::fs::File::create(&srt).await.context("create srt")?;
             for (i, segment) in captions.into_iter().enumerate() {
                 let line = format!(
@@ -416,7 +561,9 @@ async fn main() -> anyhow::Result<()> {
             }
             outfile.flush().await.context("flush srt")?;
 
-            println!(" .. '{}' | done", video.path.display());
+            if !quiet {
+                println!(" .. '{}' | done", video.path.display());
+            }
             Ok(())
         };
         tasks.spawn(async move {
@@ -429,7 +576,9 @@ async fn main() -> anyhow::Result<()> {
         let v = tasks.join_next().await.expect("!is_empty");
         let _ = v.context("join failed")?.context("job failed")?;
     }
-    eprintln!("==> all transcription completed");
+    if !args.quiet {
+        eprintln!("==> all transcription completed");
+    }
 
     Ok(())
 }
