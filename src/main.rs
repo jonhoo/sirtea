@@ -81,13 +81,25 @@ async fn main() -> anyhow::Result<()> {
             .format
             .tracks()
             .iter()
-            .find(|t| t.codec_params.channel_layout.is_some())
+            .find(|t| t.codec_params.sample_rate.is_some())
         else {
+            if !args.quiet {
+                eprintln!(
+                    "warning: skipping '{}': no audio track found",
+                    path.display()
+                );
+            }
             continue;
         };
         let (Some(time_base), Some(n_frames)) =
             (track.codec_params.time_base, track.codec_params.n_frames)
         else {
+            if !args.quiet {
+                eprintln!(
+                    "warning: skipping '{}': unable to determine audio duration",
+                    path.display()
+                );
+            }
             continue;
         };
         let length = time_base.calc_time(n_frames);
@@ -277,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
                                     ffmpeg.stdout.take().expect("set to piped"),
                                     BytesCodec::new(),
                                 )))
-                                .mime_str("audio/opous")
+                                .mime_str("audio/opus")
                                 .context("valid mime string")?,
                             )
                             .text("toggle_diarization", "false"),
