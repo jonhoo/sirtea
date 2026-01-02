@@ -194,21 +194,60 @@ fn get_api_key(config: &Config) -> anyhow::Result<String> {
     })
 }
 
+// Gladia API v2 response types
+// See: https://docs.gladia.io/api-reference/v2/
+
+/// Response from POST /v2/upload
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "snake_case")]
-struct GladiaTranscribeResponse {
-    prediction: Vec<Prediction>,
+struct UploadResponse {
+    audio_url: String,
+}
+
+/// Response from POST /v2/pre-recorded
+#[derive(Deserialize, Debug)]
+struct TranscriptionInitResponse {
+    id: String,
+    // result_url is also returned but we construct it ourselves
+}
+
+/// Response from GET /v2/pre-recorded/{id}
+#[derive(Deserialize, Debug)]
+struct TranscriptionStatusResponse {
+    status: String,
+    #[serde(default)]
+    result: Option<TranscriptionResult>,
+    #[serde(default)]
+    error: Option<TranscriptionError>,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "snake_case")]
-struct Prediction {
-    // confidence: f64,
-    // language: String,
-    time_begin: f64,
-    time_end: f64,
-    transcription: String,
-    // NOTE: ignoring words
+struct TranscriptionError {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct TranscriptionResult {
+    transcription: Transcription,
+}
+
+#[derive(Deserialize, Debug)]
+struct Transcription {
+    utterances: Vec<Utterance>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Utterance {
+    /// Start time in seconds (v2 API returns seconds, not milliseconds)
+    start: f64,
+    /// End time in seconds
+    end: f64,
+    /// The transcribed text
+    text: String,
+    // NOTE: The API also returns `language`, `channel`, `confidence`, and per-word timing in
+    // `words`, but we use only utterance-level timing for SRT output.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -471,9 +510,10 @@ async fn main() -> anyhow::Result<()> {
                 // segments at block boundaries for the audio codec (e.g., blocks in AAC).
                 // instead, we need to reencode, which allows extracting exact times since the
                 // input is muxed. it's tempting to reencode to flac, which is lossless, but then
-                // we quickly run into the 500MB file size limit. so, we go with opus, which is
-                // modern, compact, and high-quality. we avoid aac because some aac encoders are
-                // bad.
+                // we quickly run into the 1000MB file size limit
+                // (https://docs.gladia.io/chapters/limits-and-specifications/supported-formats#gladia-api-current-limitations).
+                // so, we go with opus, which is modern, compact, and high-quality. we avoid aac
+                // because some aac encoders are bad.
                 let start_f64 = start.as_secs_f64();
                 let ss = start_f64.to_string();
                 ffmpeg
@@ -499,8 +539,8 @@ async fn main() -> anyhow::Result<()> {
                         .arg(format!("adelay={}", video.delay.as_millis()));
                 }
 
-                if let Some(duration_limit) = duration_limit {
-                    ffmpeg.arg("-t").arg(duration_limit.to_string());
+                if let Some(limit) = duration_limit {
+                    ffmpeg.arg("-t").arg(limit.to_string());
                 }
 
                 let mut ffmpeg = ffmpeg
@@ -512,34 +552,31 @@ async fn main() -> anyhow::Result<()> {
                     .spawn()
                     .context("ffmpeg split")?;
 
-                let req = client
-                    .post("https://api.gladia.io/audio/text/audio-transcription/")
+                // Step 1: Upload audio to Gladia
+                // See: https://docs.gladia.io/api-reference/v2/upload/audio-file
+                let upload_req = client
+                    .post("https://api.gladia.io/v2/upload")
                     .header("x-gladia-key", &gladia_api_key)
-                    .header("Accept", "application/json")
                     .multipart(
-                        Form::new()
-                            .part(
-                                "audio",
-                                Part::stream(reqwest::Body::wrap_stream(FramedRead::new(
-                                    ffmpeg.stdout.take().expect("set to piped"),
-                                    BytesCodec::new(),
-                                )))
-                                .mime_str("audio/opus")
-                                .context("valid mime string")?,
-                            )
-                            .text("toggle_diarization", "false"),
+                        Form::new().part(
+                            "audio",
+                            Part::stream(reqwest::Body::wrap_stream(FramedRead::new(
+                                ffmpeg.stdout.take().expect("set to piped"),
+                                BytesCodec::new(),
+                            )))
+                            .mime_str("audio/opus")
+                            .context("valid mime string")?
+                            .file_name("audio.ogg"),
+                        ),
                     )
                     .send();
 
-                let (res, ffmpeg) = tokio::join!(req, ffmpeg.wait_with_output());
+                let (upload_res, ffmpeg) = tokio::join!(upload_req, ffmpeg.wait_with_output());
                 let ffmpeg = ffmpeg.context("extract audio")?;
-                let res = match (res, ffmpeg.status.success()) {
+                let upload_res = match (upload_res, ffmpeg.status.success()) {
                     (Ok(res), true) if res.status().is_success() => res,
                     (Ok(res), _) => {
-                        // we got an error response, so print all we can
-                        // if res is a 2XX but ffmpeg failed, we'll also land here
-                        // but that's probably appropriate
-                        let ffmpeg = String::from_utf8_lossy(&ffmpeg.stderr);
+                        let ffmpeg_err = String::from_utf8_lossy(&ffmpeg.stderr);
                         let code = res.status();
                         let gladia = res
                             .text()
@@ -547,24 +584,120 @@ async fn main() -> anyhow::Result<()> {
                             .unwrap_or_else(|_| String::from("<failed to read>"));
                         return Err(anyhow::anyhow!(gladia))
                             .with_context(|| format!("HTTP status: {code}"))
-                            .with_context(|| format!("ffmpeg output:\n{ffmpeg}"))
-                            .context("run transcription");
+                            .with_context(|| format!("ffmpeg output:\n{ffmpeg_err}"))
+                            .context("upload audio to Gladia");
                     }
                     (Err(e), _) => {
-                        // the request couldn't even be issued. probably an I/O error.
-                        let ffmpeg = String::from_utf8_lossy(&ffmpeg.stderr);
+                        let ffmpeg_err = String::from_utf8_lossy(&ffmpeg.stderr);
                         Err(e)
-                            .with_context(|| format!("ffmpeg output:\n{ffmpeg}"))
-                            .context("issue transcribe request")?
+                            .with_context(|| format!("ffmpeg output:\n{ffmpeg_err}"))
+                            .context("upload audio to Gladia")?
                     }
                 };
 
-                let res: serde_json::Value = res.json().await.context("parse json")?;
-                let mut res: GladiaTranscribeResponse = serde_json::from_value(res)
-                    .context("parse Gladia response")?;
+                let upload: UploadResponse = upload_res
+                    .json()
+                    .await
+                    .context("parse upload response")?;
+
+                // Step 2: Initiate transcription
+                // See: https://docs.gladia.io/api-reference/v2/pre-recorded/init
+                let init_res = client
+                    .post("https://api.gladia.io/v2/pre-recorded")
+                    .header("x-gladia-key", &gladia_api_key)
+                    .header("Content-Type", "application/json")
+                    .json(&serde_json::json!({
+                        "audio_url": upload.audio_url,
+                        "diarization": false
+                    }))
+                    .send()
+                    .await
+                    .context("initiate transcription")?;
+
+                if !init_res.status().is_success() {
+                    let code = init_res.status();
+                    let body = init_res
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| String::from("<failed to read>"));
+                    return Err(anyhow::anyhow!(body))
+                        .with_context(|| format!("HTTP status: {code}"))
+                        .context("initiate transcription");
+                }
+
+                let init: TranscriptionInitResponse = init_res
+                    .json()
+                    .await
+                    .context("parse transcription init response")?;
+
+                if let Some(ref pb) = progress_bar {
+                    let msg = if segment_count == 1 {
+                        "transcribing".to_string()
+                    } else if let Some((gap_secs, ref phrase)) = prev_split_info {
+                        format!(
+                            "transcribing segment following {gap_secs:.1}s gap after '{phrase}'"
+                        )
+                    } else {
+                        "transcribing initial segment".to_string()
+                    };
+                    pb.set_message(msg);
+                }
+
+                // Step 3: Poll for results
+                // See: https://docs.gladia.io/api-reference/v2/pre-recorded/get
+                let result_url = format!("https://api.gladia.io/v2/pre-recorded/{}", init.id);
+                let mut utterances = loop {
+                    let status_res = client
+                        .get(&result_url)
+                        .header("x-gladia-key", &gladia_api_key)
+                        .send()
+                        .await
+                        .context("poll transcription status")?;
+
+                    if !status_res.status().is_success() {
+                        let code = status_res.status();
+                        let body = status_res
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| String::from("<failed to read>"));
+                        return Err(anyhow::anyhow!(body))
+                            .with_context(|| format!("HTTP status: {code}"))
+                            .context("poll transcription status");
+                    }
+
+                    let status: TranscriptionStatusResponse = status_res
+                        .json()
+                        .await
+                        .context("parse transcription status")?;
+
+                    match status.status.as_str() {
+                        "done" => {
+                            let result = status
+                                .result
+                                .context("transcription done but no result")?;
+                            break result.transcription.utterances;
+                        }
+                        "error" => {
+                            let err = status.error.unwrap_or(TranscriptionError {
+                                code: None,
+                                message: None,
+                            });
+                            let msg = err.message.unwrap_or_else(|| "unknown error".to_string());
+                            let code = err.code.unwrap_or_else(|| "UNKNOWN".to_string());
+                            anyhow::bail!("Gladia transcription failed: {} ({})", msg, code);
+                        }
+                        "queued" | "processing" => {
+                            // Wait before polling again
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        other => {
+                            anyhow::bail!("unexpected transcription status: {}", other);
+                        }
+                    }
+                };
 
                 // Gladia should always return at least one caption for non-silent audio
-                if res.prediction.is_empty() {
+                if utterances.is_empty() {
                     anyhow::bail!(
                         "Gladia returned no captions for segment starting at {}. \
                          This may indicate silent audio or an API issue.",
@@ -581,28 +714,24 @@ async fn main() -> anyhow::Result<()> {
                     // but the end point may be in the middle of a caption! So we find the time of
                     // last "gap", drop all captions following that, and resume captioning from
                     // that point rather than from start. This finds natural sentence boundaries.
-                    let mut next_starts = res
-                        .prediction
+                    let mut next_starts = utterances
                         .last()
                         .expect("checked non-empty above")
-                        .time_end;
+                        .end;
                     let mut best_gap: Option<(usize, f64, f64)> = None;
-                    for i in 0..res.prediction.len().min(20) {
-                        let i = res.prediction.len() - i - 1;
-                        let gap = next_starts - res.prediction[i].time_end;
+                    for i in 0..utterances.len().min(20) {
+                        let i = utterances.len() - i - 1;
+                        let gap = next_starts - utterances[i].end;
                         // prefer breaking at natural sentence boundaries as it reduces the
                         // likelihood that the next transcription will start at a weird point in a
                         // sentence. the ... and , endings are also acceptable, but slightly less
                         // "good" since we may end up with a captial letter starting the next
                         // caption.
-                        let score = if res.prediction[i].transcription.ends_with("...")
-                            || res.prediction[i].transcription.ends_with(',')
+                        let score = if utterances[i].text.ends_with("...")
+                            || utterances[i].text.ends_with(',')
                         {
                             1.3 * gap
-                        } else if res.prediction[i]
-                            .transcription
-                            .ends_with(['.', '?', '!', ':'])
-                        {
+                        } else if utterances[i].text.ends_with(['.', '?', '!', ':']) {
                             2.0 * gap
                         } else {
                             gap
@@ -616,39 +745,39 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             (i, gap, score)
                         });
-                        next_starts = res.prediction[i].time_begin;
+                        next_starts = utterances[i].start;
                     }
                     let gap = best_gap.expect("always a gap");
-                    let slice_at = start
-                        + Duration::from_secs_f64(res.prediction[gap.0].time_end + gap.1 / 2.0);
+                    let slice_at =
+                        start + Duration::from_secs_f64(utterances[gap.0].end + gap.1 / 2.0);
 
                     // Store split info for the next segment's status messages
-                    prev_split_info = Some((gap.1, res.prediction[gap.0].transcription.clone()));
+                    prev_split_info = Some((gap.1, utterances[gap.0].text.clone()));
 
-                    res.prediction.truncate(gap.0 + 1);
+                    utterances.truncate(gap.0 + 1);
                     start = slice_at;
                 }
 
                 // whatever captions are left, adjust their start times for the start offset
-                captions.extend(res.prediction.into_iter().map(|mut p| {
+                captions.extend(utterances.into_iter().map(|mut u| {
                     // note: this is specifically start_f64, which is not affected by us updating
                     // start at the end of the gap slicing above.
-                    p.time_begin += start_f64;
-                    p.time_end += start_f64;
-                    p
+                    u.start += start_f64;
+                    u.end += start_f64;
+                    u
                 }));
             }
 
             // Write the SRT file
             let mut outfile = tokio::fs::File::create(&srt).await.context("create srt")?;
-            for (i, segment) in captions.into_iter().enumerate() {
+            for (i, utterance) in captions.into_iter().enumerate() {
                 let line = format!(
                     "{}{}\n{} --> {}\n{}\n",
                     if i != 0 { "\n" } else { "" },
                     i + 1,
-                    format_srt_timestamp(segment.time_begin),
-                    format_srt_timestamp(segment.time_end),
-                    segment.transcription,
+                    format_srt_timestamp(utterance.start),
+                    format_srt_timestamp(utterance.end),
+                    utterance.text,
                 );
                 outfile
                     .write_all(line.as_bytes())
