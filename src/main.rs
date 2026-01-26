@@ -661,6 +661,7 @@ async fn main() -> anyhow::Result<()> {
                     .header("Content-Type", "application/json")
                     .json(&serde_json::json!({
                         "audio_url": upload.audio_url,
+                        "punctuation_enhanced": true,
                         "diarization": false
                     }))
                     .send()
