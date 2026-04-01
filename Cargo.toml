@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "multimedia::video"]
 [dependencies]
 anyhow = "1.0.75"
 directories = "6.0.0"
-indicatif = "0.18.3"
+indicatif = "0.18.4"
 lexopt = "0.3.1"
 reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
 serde = { version = "1.0.193", features = ["derive"] }
