@@ -4,21 +4,17 @@
 #   Linux:   ~/.config/sirtea/config.toml
 #   macOS:   ~/Library/Application Support/sirtea/config.toml
 #   Windows: C:\Users\<user>\AppData\Roaming\sirtea\config.toml
-#
-# Or set the GLADIA_API_KEY environment variable instead.
 
-# Required: Your Gladia API key
-# Get one at https://app.gladia.io/ -> Account -> Generate Key
-gladia_api_key = ""
-
-# Optional: Maximum cost before stopping transcription (in dollars)
-# Default: 10.0
-# max_cost = 10.0
-
-# Optional: Number of concurrent transcriptions
-# Default: 3
-# parallel = 3
+# Optional: Directory holding the Parakeet model files
+# (encoder-model.int8.onnx, decoder_joint-model.int8.onnx, nemo128.onnx,
+# vocab.txt from https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx).
+# Default: unset, meaning the model is downloaded automatically on first run
+# into the per-user data dir (e.g. ~/.local/share/sirtea/models/ on Linux).
+# model_path = "/path/to/parakeet-model"
 
 # Optional: Maximum segment length in seconds before splitting
-# Default: 5400 (1h30m)
-# segment_length = 5400
+# The bundled Parakeet model accepts at most ~200 seconds of audio per
+# inference call, so this cannot be raised meaningfully; lowering it mainly
+# reduces memory use.
+# Default: 195 (3m15s)
+# segment_length = 195
