@@ -4,9 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`sirtea` is a CLI tool that transcribes video files to SRT subtitle files using the Gladia speech-to-text API (v2). Accepts any video filename; outputs `<basename>.srt` alongside the input.
+`sirtea` is a CLI tool that transcribes video files to SRT subtitle files
+using NVIDIA's Parakeet speech-to-text model, run fully locally via ONNX
+Runtime (through the `transcribe-rs` crate). Accepts any video filename;
+outputs `<basename>.srt` alongside the input.
 
-For background on why this tool exists, see [the blog post](https://thesquareplanet.com/blog/ai-captioning/).
+For background on why this tool exists, see [the blog post](https://thesquareplanet.com/blog/ai-captioning/)
+(written when the tool still used the Gladia cloud API; the segmentation
+approach it describes is unchanged).
 
 ## Build and Test Commands
 
@@ -19,14 +24,18 @@ cargo run -- <path>...   # Run with video files or directories
 
 ## Configuration
 
-Set `GLADIA_API_KEY` environment variable, or create a config file at the XDG config path:
+Configuration is optional. Config file at the XDG config path:
 - Linux: `~/.config/sirtea/config.toml`
 - macOS: `~/Library/Application Support/sirtea/config.toml`
 - Windows: `%APPDATA%\sirtea\config.toml`
 
-See `config.example.toml` for available options (`max_cost`, `parallel`, `segment_length`).
+See `config.example.toml` for available options (`model_path`,
+`segment_length`).
 
-**Note for Claude:** If `sirtea` fails with "No Gladia API key found", ask the user to configure the key in their environment or config file — do not attempt to set it yourself.
+The Parakeet model files (~670 MB) are auto-downloaded on first run from
+HuggingFace (`istupakov/parakeet-tdt-0.6b-v3-onnx`) into the per-user data
+dir (Linux: `~/.local/share/sirtea/models/`), unless `model_path`/`--model`
+points at an existing model directory.
 
 ## Architecture
 
@@ -34,27 +43,28 @@ Single-file async Rust application (`src/main.rs`) that:
 
 1. **Discovers files** - Accepts video files or directories; recurses directories with `walkdir`
 2. **Probes media** - Uses `symphonia` to read audio track metadata (duration, sample rate)
-3. **Extracts audio** - Uses ffmpeg to re-encode to Opus in OGG container, streaming directly to Gladia
-4. **Handles long videos** - Splits videos exceeding `DEFAULT_MAX_SEGMENT_LENGTH` (90 minutes) into chunks, finding natural sentence boundaries (gaps after punctuation) for clean splits
-5. **Transcribes via Gladia v2** - Uploads audio, initiates transcription, polls for results (up to `DEFAULT_CONCURRENT_TRANSCRIBES` parallel requests)
-6. **Cost control** - Tracks estimated cost and skips videos that would exceed `DEFAULT_MAX_COST`
+3. **Ensures the model** - Downloads the int8 Parakeet ONNX model on first run (atomic: downloads to a `.tmp` dir, renames into place)
+4. **Extracts audio** - Uses ffmpeg to decode to raw 16 kHz mono f32 PCM, buffered in memory per segment
+5. **Handles long videos** - Splits videos exceeding `DEFAULT_MAX_SEGMENT_LENGTH` into chunks (the Parakeet ONNX export accepts at most ~200s of audio per inference call), preferring sentence-final punctuation for clean splits (Parakeet's token timestamps are contiguous, so there are no silence gaps to detect)
+6. **Transcribes locally** - Runs Parakeet inference via `transcribe-rs` with `TimestampGranularity::Segment`, one video at a time; uses the GPU automatically via ONNX Runtime's WebGPU execution provider (selected explicitly in `main` — transcribe-rs's `Auto` mode never picks WebGPU), falling back to CPU when no GPU/Vulkan stack is available
 7. **Outputs SRT** - Writes captions with timestamps; skips if `.srt` already exists
 
 ### Key Constants
 
-- `DEFAULT_MAX_SEGMENT_LENGTH`: 5400 seconds (1h30m) — stays under Gladia's 135-minute limit with margin
-- `DEFAULT_CONCURRENT_TRANSCRIBES`: 3 — matches Gladia's free tier concurrency limit
-- `DEFAULT_MAX_COST`: $10 — safety limit to prevent runaway spending
-- `PRICE_PER_SECOND`: $0.0001694 — used for cost estimation
+- `DEFAULT_MAX_SEGMENT_LENGTH`: 195 seconds (3m15s) — just under the ~200s per-inference limit baked into the ONNX export's positional-embedding table
+- `ESTIMATED_REALTIME_FACTOR`: 6 — measured CPU throughput, used only for `--dry-run` estimates
+- `MODEL_REPO` / `MODEL_FILES`: the pinned HuggingFace model repo and the exact int8 files downloaded from it
 
 ### CLI Flags
 
-- `--dry-run`: Estimate cost without transcribing
-- `--max-cost`, `--parallel`, `--segment-length`: Override config/defaults
+- `--dry-run`: List what would be transcribed (durations + estimated processing time)
+- `--model`, `--segment-length`: Override config/defaults
 - `-q`/`--quiet`: Errors only (no progress bars)
 - `-v`/`--verbose`: Print split point details when segmenting
 - `-x`/`--one-file-system`: Don't cross filesystem boundaries when recursing
 
 ## External Dependencies
 
-Requires `ffmpeg` and `ffprobe` in PATH for audio extraction and delay detection.
+Requires `ffmpeg` and `ffprobe` in PATH for audio extraction and delay
+detection. ONNX Runtime is linked in at build time by the `ort` crate
+(its build script downloads prebuilt binaries).
