@@ -927,6 +927,20 @@ async fn main() -> anyhow::Result<()> {
         } else {
             Duration::from_secs_f64(delay)
         };
+        // Segment 0's ffmpeg `-t` is `segment_length - delay` (the adelay
+        // filter pads the front with silence, so we consume correspondingly
+        // less input), which would go to zero or negative if the segment
+        // length doesn't clear the delay. Catch that here, where both values
+        // are first known, rather than letting ffmpeg fail opaquely mid-run.
+        // Delays are normally milliseconds, so this only fires on a
+        // pathological --segment-length. This also rejects a non-positive or
+        // NaN segment length, since `delay` is always >= 0.
+        anyhow::ensure!(
+            segment_length > delay.as_secs_f64(),
+            "segment length ({segment_length}s) must exceed the audio start delay ({:.3}s) of '{}'",
+            delay.as_secs_f64(),
+            path.display()
+        );
         videos.insert(LocalVideo {
             length,
             path,
