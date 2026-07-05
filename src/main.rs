@@ -36,6 +36,70 @@ const DEFAULT_MAX_SEGMENT_LENGTH: f64 = 195.0; // 3m15s
 // Zen 3; transcribe-rs quotes 20-30x on other hardware, so this is conservative.
 const ESTIMATED_REALTIME_FACTOR: f64 = 6.0;
 
+// ============================================================================
+// Cue shaping constants (see the cue-building section below for the
+// algorithm that uses them)
+// ============================================================================
+
+/// The standard subtitle envelope per the BBC/Netflix guidelines: at most two
+/// lines of at most 42 characters each, and at most ~7 seconds on screen
+/// before a static cue reads as "stuck". Note there is deliberately no
+/// "max chars per cue" constant: the real limit is that the cue's words can
+/// be laid out as two fitting lines, which depends on where its spaces fall,
+/// not just on the total (see `split_sentence_into_cues`).
+const MAX_LINE_CHARS: usize = 42;
+const MAX_CUE_SECS: f64 = 7.0;
+
+/// Below roughly a second, a cue "flashes" and can't be read. Cues this short
+/// are penalized (not forbidden: a lone "Cool." sentence has nowhere to go,
+/// since we never merge cues across sentence boundaries), so the cue builder
+/// avoids shaving tiny fragments off a sentence when a more balanced split is
+/// available.
+const MIN_CUE_SECS: f64 = 1.0;
+const SHORT_CUE_PENALTY_PER_SEC: f64 = 25.0;
+
+/// Ditto for characters: a cue with just a word or two of text reads as a
+/// crumb. Without this, equally-priced mid-clause breaks tie, and the tie
+/// resolves to whatever the DP scans first — observed as a long sentence
+/// shedding a lone "doing." cue at its end.
+const MIN_CUE_CHARS: usize = 20;
+const SHORT_CUE_PENALTY_PER_CHAR: f64 = 1.0;
+
+/// Costs for ending a cue after a given word, from best to worst: `:` and `;`
+/// mark strong clause boundaries; an inferred pause (see
+/// `WORD_SPEECH_PER_CHAR` below) is just as good, since silence is a stronger
+/// cue than punctuation; `,` and `...` are acceptable; and a mid-clause break
+/// is a last resort, but must stay finitely priced because long unpunctuated
+/// stretches have to break *somewhere*. Sentence-final punctuation has no
+/// cost constant: sentence ends are always cue boundaries.
+const BOUNDARY_COLON: f64 = 4.0;
+const BOUNDARY_PAUSE: f64 = 4.0;
+const BOUNDARY_CLAUSE: f64 = 8.0;
+const BOUNDARY_NONE: f64 = 30.0;
+
+/// Breaking right after a function word severs it from the phrase it
+/// introduces ("...being a tool we | can make use of..." splits a subject
+/// from its verb). Added on top of `BOUNDARY_NONE` so the DP prefers
+/// sliding a forced mid-clause break a word or two to a phrase edge.
+/// Punctuated boundaries are exempt: a break after "so," is fine even
+/// though "so" is a conjunction.
+const FUNCTION_WORD_BREAK_PENALTY: f64 = 10.0;
+
+/// A deliberately generous (slow) estimate of how long a word takes to say:
+/// ~11 chars/s plus fixed per-word overhead. Parakeet's word timestamps are
+/// contiguous — each word ends exactly where the next begins — so silence is
+/// absorbed into the preceding word's raw duration. A word whose raw duration
+/// exceeds this estimate by `PAUSE_MIN_SECS` therefore marks a real pause.
+/// Over-estimating errs toward keeping cues on screen slightly too long
+/// rather than cutting them off mid-word.
+const WORD_SPEECH_FLOOR: f64 = 0.25;
+const WORD_SPEECH_PER_CHAR: f64 = 0.09;
+const PAUSE_MIN_SECS: f64 = 0.8;
+
+/// How long a cue lingers after its last word has (by estimate) been spoken,
+/// so trimmed cues don't vanish the instant the voice stops.
+const CUE_LINGER_SECS: f64 = 0.5;
+
 /// The HuggingFace repository holding the ONNX export of Parakeet that we use.
 const MODEL_REPO: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
 
@@ -364,7 +428,9 @@ enum PrevSegment {
     Silence,
 }
 
-/// A transcribed utterance: the unit that becomes one SRT cue.
+/// A transcribed span of speech with timestamps. Used both for the raw
+/// word-level output of Parakeet (one word per `Utterance`) and for the
+/// re-grouped cues that become SRT entries (see `build_cues`).
 #[derive(Debug)]
 struct Utterance {
     /// Start time in seconds
@@ -373,6 +439,335 @@ struct Utterance {
     end: f64,
     /// The transcribed text
     text: String,
+}
+
+// ============================================================================
+// Cue building: re-grouping word timestamps into subtitle-sized cues
+// ============================================================================
+//
+// Parakeet's own `Segment` timestamp granularity splits only at
+// sentence-final punctuation, and real (lecture) speech is full of run-on
+// sentences, so its cues routinely blow past what a viewer can read
+// (measured on a 73-minute lecture: 47% of cues over 84 chars, the worst at
+// 456 chars / 29 seconds). We instead transcribe at `Word` granularity and
+// re-group words into cues ourselves, aiming for the standard subtitle
+// envelope (two lines of `MAX_LINE_CHARS`, at most `MAX_CUE_SECS` each).
+//
+// One property of Parakeet's output does a lot of work here: token
+// timestamps are contiguous — each word ends exactly where the next one
+// begins — so silence is absorbed into the *end* of the preceding word. That
+// means (a) there are no inter-word gaps to split at, but (b) a word whose
+// raw duration far exceeds the time needed to actually say it marks a real
+// pause. We use (b) both to prefer split points at pauses and to trim cue
+// end times so captions don't linger on screen through silence.
+
+/// Estimated time to speak `text`; a deliberate over-estimate (see the
+/// comment on `WORD_SPEECH_PER_CHAR`).
+fn est_spoken_secs(text: &str) -> f64 {
+    WORD_SPEECH_FLOOR + WORD_SPEECH_PER_CHAR * text.chars().count() as f64
+}
+
+/// Does `word` end a sentence, given the word that follows it (if any)?
+///
+/// Sentence-final punctuation alone is not enough: abbreviations like "e.g."
+/// or "Dr." also end with '.'. Requiring the next word to look like a
+/// sentence start (capital letter or digit) filters most of those out.
+fn ends_sentence(word: &str, next: Option<&str>) -> bool {
+    let word = word.trim_end_matches(['"', '\'', ')', '”', '’']);
+    if !word.ends_with(['.', '?', '!']) {
+        return false;
+    }
+    next.is_none_or(|next| {
+        next.chars()
+            .find(|c| c.is_alphanumeric())
+            .is_some_and(|c| c.is_uppercase() || c.is_numeric())
+    })
+}
+
+/// Words that introduce the phrase that follows them: articles,
+/// prepositions, conjunctions, pronouns, auxiliaries, and common
+/// intensifiers. A line or cue should not end right after one of these
+/// (see `FUNCTION_WORD_BREAK_PENALTY`).
+fn is_function_word(word: &str) -> bool {
+    let word = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+    let lower = word.to_lowercase();
+    matches!(
+        lower.as_str(),
+        "the" | "a" | "an" // articles
+        | "and" | "or" | "but" | "nor" | "so" | "yet" // conjunctions
+        | "to" | "of" | "in" | "on" | "at" | "by" | "for" | "with" | "from"
+        | "into" | "onto" | "about" | "over" | "under" | "between" // prepositions
+        | "as" | "if" | "that" | "which" | "who" | "whose" | "whom"
+        | "what" | "when" | "where" | "how" | "why" | "because" // subordinators
+        | "is" | "are" | "was" | "were" | "be" | "been" | "being" | "am"
+        | "do" | "does" | "did" | "will" | "would" | "can" | "could"
+        | "should" | "shall" | "may" | "might" | "must" // auxiliaries
+        | "i" | "we" | "you" | "he" | "she" | "it" | "they"
+        | "my" | "our" | "your" | "his" | "her" | "its" | "their" // pronouns
+        | "this" | "these" | "those"
+        | "not" | "no" | "very" | "really" | "just" | "quite"
+        | "some" | "any" | "each" | "every" // determiners/intensifiers
+    )
+}
+
+/// The cost of ending a cue after `word`, mid-sentence. Sentence-final
+/// boundaries never reach this function: `build_cues` splits at sentence
+/// ends before the per-sentence segmentation runs.
+fn boundary_cost(word: &Utterance) -> f64 {
+    // Check `...` before `,`/`:`/`;`: it must not fall through to the
+    // single-character cases, and certainly not to BOUNDARY_NONE.
+    let punctuation = if word.text.ends_with("...") || word.text.ends_with(',') {
+        BOUNDARY_CLAUSE
+    } else if word.text.ends_with([':', ';']) {
+        BOUNDARY_COLON
+    } else if is_function_word(&word.text) {
+        BOUNDARY_NONE + FUNCTION_WORD_BREAK_PENALTY
+    } else {
+        BOUNDARY_NONE
+    };
+    // Contiguous timestamps absorb silence into the preceding word, so an
+    // inflated raw duration reveals a pause (see WORD_SPEECH_PER_CHAR).
+    let trailing_silence = (word.end - word.start) - est_spoken_secs(&word.text);
+    if trailing_silence >= PAUSE_MIN_SECS {
+        punctuation.min(BOUNDARY_PAUSE)
+    } else {
+        punctuation
+    }
+}
+
+/// Re-group word-level utterances into subtitle-sized cues.
+///
+/// Words are first split into sentences (a cue never spans a sentence
+/// boundary), and each sentence is then segmented into cues that fit the
+/// subtitle envelope by `split_sentence_into_cues`.
+fn build_cues(words: &[Utterance]) -> Vec<Utterance> {
+    let mut cues = Vec::new();
+    let mut sentence_start = 0;
+    for i in 0..words.len() {
+        let next = words.get(i + 1).map(|w| w.text.as_str());
+        // The last word always terminates the final sentence, punctuated or
+        // not: hard cuts at segment ends can leave unpunctuated tails.
+        if next.is_none() || ends_sentence(&words[i].text, next) {
+            split_sentence_into_cues(&words[sentence_start..=i], &mut cues);
+            sentence_start = i + 1;
+        }
+    }
+    cues
+}
+
+/// Split one sentence's words into cues, appending them to `cues`.
+///
+/// This is a Knuth-Plass-style minimum-cost segmentation over word
+/// boundaries: `best[i]` is the cheapest way to emit `sentence[..i]` as
+/// whole cues, built up by considering every feasible last cue
+/// `sentence[j..i]`. Compared to greedily bisecting over-long sentences,
+/// the global optimum avoids shaving off awkward single-word tail cues, and
+/// all tuning lives in the cost constants at the top of the file. Cost is
+/// negligible: the inner loop is bounded by how many words fit in a cue.
+fn split_sentence_into_cues(sentence: &[Utterance], cues: &mut Vec<Utterance>) {
+    let n = sentence.len();
+    if n == 0 {
+        return;
+    }
+
+    // Prefix sums of word lengths so any candidate cue's character count
+    // (words plus joining spaces) is O(1).
+    let mut chars_before = Vec::with_capacity(n + 1);
+    chars_before.push(0usize);
+    for w in sentence {
+        chars_before.push(chars_before.last().expect("vec starts non-empty") + w.text.chars().count());
+    }
+    let cue_chars = |j: usize, i: usize| chars_before[i] - chars_before[j] + (i - j - 1);
+
+    // Can sentence[j..i] be laid out as at most two lines of at most
+    // MAX_LINE_CHARS? This — not a total-character cap — is the real size
+    // limit: an 84-char cue only wraps into two fitting lines if a space
+    // falls exactly in the middle, so a cue must be rejected unless *some*
+    // word boundary splits it into two fitting lines. (Shrinking a
+    // wrappable span keeps it wrappable, so the early-break in the DP loop
+    // below remains valid.)
+    let fits_two_lines = |j: usize, i: usize| {
+        cue_chars(j, i) <= MAX_LINE_CHARS
+            || (j + 1..i)
+                .any(|k| cue_chars(j, k) <= MAX_LINE_CHARS && cue_chars(k, i) <= MAX_LINE_CHARS)
+    };
+
+    let mut best = vec![f64::INFINITY; n + 1];
+    let mut back = vec![0usize; n + 1];
+    best[0] = 0.0;
+    for i in 1..=n {
+        // Ending a cue at the sentence end is free — it's a mandatory
+        // break — while anywhere else costs by how natural the boundary is.
+        let break_cost = if i == n {
+            0.0
+        } else {
+            boundary_cost(&sentence[i - 1])
+        };
+        // Measure candidate cues as they will be displayed: the final
+        // word's trailing absorbed silence gets trimmed at emission below,
+        // so it must not count against the duration limit — otherwise a
+        // long pause after a short sentence fragment makes every multi-word
+        // candidate infeasible and forces a lone-word crumb cue before the
+        // pause. Pauses *inside* a candidate still count in full, since an
+        // earlier word's inflated end delays every word after it — so a
+        // long internal pause still blows the limit and forces a split at
+        // the pause, exactly where one belongs.
+        let last = &sentence[i - 1];
+        let display_end = last
+            .end
+            .min(last.start + est_spoken_secs(&last.text) + CUE_LINGER_SECS);
+        for j in (0..i).rev() {
+            let duration = display_end - sentence[j].start;
+            if !fits_two_lines(j, i) || duration > MAX_CUE_SECS {
+                // A single word (j == i - 1) is exempt from the limits: it
+                // cannot be split any further, and letting it through as an
+                // over-long cue beats dropping it. This also guarantees
+                // best[i] is always reachable.
+                if j != i - 1 {
+                    // Both metrics only grow as j decreases; we're done.
+                    break;
+                }
+            }
+            let short_penalty = SHORT_CUE_PENALTY_PER_SEC * (MIN_CUE_SECS - duration).max(0.0)
+                + SHORT_CUE_PENALTY_PER_CHAR
+                    * MIN_CUE_CHARS.saturating_sub(cue_chars(j, i)) as f64;
+            let cost = best[j] + short_penalty + break_cost;
+            if cost < best[i] {
+                best[i] = cost;
+                back[i] = j;
+            }
+        }
+    }
+
+    // Walk the backpointers to recover the boundaries, then emit in order.
+    let mut boundaries = vec![n];
+    while *boundaries.last().expect("vec starts non-empty") > 0 {
+        boundaries.push(back[*boundaries.last().expect("vec starts non-empty")]);
+    }
+    boundaries.reverse();
+    for pair in boundaries.windows(2) {
+        let words = &sentence[pair[0]..pair[1]];
+        let text = words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let start = words[0].start;
+        let last = words.last().expect("cue spans at least one word");
+        // Trim the display time so a cue doesn't linger through the silence
+        // absorbed into its final word's raw end, but never below the
+        // readability floor and never past the raw end (which would overlap
+        // the next cue).
+        // TODO: measuring RMS energy on the raw samples would trim (and
+        // place pause boundaries) exactly instead of by estimate; that
+        // belongs together with the split-preference TODO in `main`.
+        let end = last
+            .end
+            .min(last.start + est_spoken_secs(&last.text) + CUE_LINGER_SECS)
+            .max(start + MIN_CUE_SECS)
+            .min(last.end);
+        cues.push(Utterance { start, end, text });
+    }
+}
+
+/// Wrap cue text into at most two lines of `MAX_LINE_CHARS`, breaking at the
+/// space that best balances the lines, with a preference for breaking just
+/// after clause punctuation near the middle. Text that fits on one line is
+/// returned untouched. We do this ourselves rather than leaving it to the
+/// player because SRT has no wrap hinting and players wrap unpredictably
+/// (at arbitrary widths, at arbitrary words, or not at all).
+fn balance_lines(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= MAX_LINE_CHARS {
+        return text.to_string();
+    }
+    // Breaking at the space at character position p yields a first line of p
+    // chars and a second of total - p - 1. Scan every space and keep the
+    // cheapest break; `<` (not `<=`) on the comparison makes ties resolve to
+    // the earlier space, i.e. the bottom-heavy split, which is the
+    // conventional subtitle shape.
+    let mut best: Option<(usize, f64)> = None; // (byte index, cost)
+    let mut prev: Option<char> = None;
+    let mut word_start = 0; // byte index where the word before the space began
+    for (char_pos, (byte_idx, c)) in text.char_indices().enumerate() {
+        if c == ' ' {
+            let line1 = char_pos;
+            let line2 = total - char_pos - 1;
+            let mut cost = (line1 as f64 - line2 as f64).abs();
+            // A clause boundary beats pure balance when it's within ~10
+            // chars of the middle (the discount outweighs up to 20 units of
+            // imbalance); conversely, ending a line on a function word
+            // severs it from its phrase, so nudge the break elsewhere.
+            // TODO: the nudge still loses to balance on ~8% of two-line cues
+            // (measured on a 73-min lecture eval), which end line 1 on a
+            // function word anyway; raising it is the knob to try, at the
+            // cost of more lopsided lines.
+            if prev.is_some_and(|p| matches!(p, ',' | ';' | ':' | '.' | '?' | '!')) {
+                cost -= 20.0;
+            } else if is_function_word(&text[word_start..byte_idx]) {
+                cost += 15.0;
+            }
+            // An over-long line is far worse than any imbalance, but keep it
+            // finite: a cue containing a >42-char token should still break
+            // at its least-bad space rather than not at all.
+            if line1 > MAX_LINE_CHARS || line2 > MAX_LINE_CHARS {
+                cost += 1000.0;
+            }
+            if best.is_none_or(|(_, c)| cost < c) {
+                best = Some((byte_idx, cost));
+            }
+            word_start = byte_idx + 1;
+        }
+        prev = Some(c);
+    }
+    match best {
+        // No spaces at all: one giant token; nothing sensible to do.
+        None => text.to_string(),
+        Some((byte_idx, _)) => format!("{}\n{}", &text[..byte_idx], &text[byte_idx + 1..]),
+    }
+}
+
+/// Pick the cue to end a transcription segment after, from the trailing
+/// window of `utterances`. Returns an index into `utterances`.
+///
+/// We prefer breaking at natural sentence boundaries, as that reduces the
+/// likelihood that the next transcription will start at a weird point in a
+/// sentence. `...` and `,` endings are also acceptable, but slightly less
+/// "good" since we may end up with a capital letter starting the next
+/// caption.
+fn pick_split_index(utterances: &[Utterance]) -> usize {
+    let window = utterances.len().min(20);
+    let mut best: Option<(usize, f64)> = None;
+    // offset 0 (the very last caption) is deliberately excluded: the
+    // model punctuates speech truncated by the hard cut as if it were a
+    // complete sentence, so the final caption's "sentence end" is often
+    // fabricated, and splitting there is equivalent to not splitting at
+    // a boundary at all. (The pre-Parakeet gap-based scoring excluded it
+    // implicitly: the last caption's gap was always zero.) The truncated
+    // caption gets dropped by the caller and re-transcribed in the next
+    // segment.
+    for offset in 1..window {
+        let i = utterances.len() - offset - 1;
+        let text = &utterances[i].text;
+        let punctuation_score = if text.ends_with("...") || text.ends_with(',') {
+            1.3
+        } else if text.ends_with(['.', '?', '!', ':']) {
+            2.0
+        } else {
+            1.0
+        };
+        // among equally-good boundaries, prefer later ones so that we keep as
+        // much as possible of the audio we have already transcribed. the
+        // fall-off is gentle enough that a sentence end deep in the window
+        // still beats an unpunctuated caption at the very end.
+        let recency_score = 1.0 - 0.5 * (offset as f64 / window as f64);
+        let score = punctuation_score * recency_score;
+        if best.is_none_or(|(_, s)| score > s) {
+            best = Some((i, score));
+        }
+    }
+    // A segment with a single caption leaves no choice but the hard cut.
+    best.map(|(i, _)| i).unwrap_or(utterances.len() - 1)
 }
 
 /// Reinterpret the raw little-endian f32 PCM bytes emitted by ffmpeg's
@@ -819,14 +1214,17 @@ async fn main() -> anyhow::Result<()> {
                         &samples,
                         &ParakeetParams {
                             language: None,
-                            // Segment granularity groups words into
-                            // sentence-ish chunks at punctuation, which is
-                            // exactly the size we want an SRT cue to be.
-                            timestamp_granularity: Some(TimestampGranularity::Segment),
+                            // Word granularity gives per-word timestamps,
+                            // which build_cues re-groups into subtitle-sized
+                            // cues. (Parakeet's own Segment granularity
+                            // splits only at sentence-final punctuation,
+                            // which produces cues far too long to read; see
+                            // the cue-building section.)
+                            timestamp_granularity: Some(TimestampGranularity::Word),
                         },
                     )
                     .context("transcribe audio segment")?;
-                let mut utterances: Vec<Utterance> = transcription
+                let words: Vec<Utterance> = transcription
                     .segments
                     .unwrap_or_default()
                     .into_iter()
@@ -836,6 +1234,7 @@ async fn main() -> anyhow::Result<()> {
                         text: s.text,
                     })
                     .collect();
+                let mut utterances = build_cues(&words);
 
                 // A fully-silent stretch (a break in a lecture, credits, etc.) transcribes
                 // to zero captions. That's not an error for a single segment — skip past
@@ -876,47 +1275,22 @@ async fn main() -> anyhow::Result<()> {
                     //
                     // Note that we cannot look for silence gaps between captions here (as this
                     // code did in its cloud-API days): Parakeet's token timestamps are contiguous
-                    // by construction — each token ends exactly where the next one begins — so
-                    // the gap between consecutive captions is always zero.
+                    // by construction, so consecutive *words* never have a gap between them
+                    // (build_cues instead infers pauses from inflated word durations).
                     // TODO: we hold the raw samples right here; measuring RMS energy around
                     // candidate boundaries would let us prefer genuinely quiet ones again.
-                    let window = utterances.len().min(20);
-                    let mut best: Option<(usize, f64)> = None;
-                    // offset 0 (the very last caption) is deliberately excluded: the
-                    // model punctuates speech truncated by the hard cut as if it were a
-                    // complete sentence, so the final caption's "sentence end" is often
-                    // fabricated, and splitting there is equivalent to not splitting at
-                    // a boundary at all. (The pre-Parakeet gap-based scoring excluded it
-                    // implicitly: the last caption's gap was always zero.) The truncated
-                    // caption gets dropped below and re-transcribed in the next segment.
-                    for offset in 1..window {
-                        let i = utterances.len() - offset - 1;
-                        let text = &utterances[i].text;
-                        // prefer breaking at natural sentence boundaries as it reduces the
-                        // likelihood that the next transcription will start at a weird point in a
-                        // sentence. the ... and , endings are also acceptable, but slightly less
-                        // "good" since we may end up with a captial letter starting the next
-                        // caption.
-                        let punctuation_score = if text.ends_with("...") || text.ends_with(',') {
-                            1.3
-                        } else if text.ends_with(['.', '?', '!', ':']) {
-                            2.0
-                        } else {
-                            1.0
-                        };
-                        // among equally-good boundaries, prefer later ones so that we keep as
-                        // much as possible of the audio we have already transcribed. the
-                        // fall-off is gentle enough that a sentence end deep in the window
-                        // still beats an unpunctuated caption at the very end.
-                        let recency_score = 1.0 - 0.5 * (offset as f64 / window as f64);
-                        let score = punctuation_score * recency_score;
-                        if best.is_none_or(|(_, s)| score > s) {
-                            best = Some((i, score));
-                        }
-                    }
-                    // A segment with a single caption leaves no choice but the hard cut.
-                    let (split_idx, _) = best.unwrap_or((utterances.len() - 1, 0.0));
-                    let slice_at = start + Duration::from_secs_f64(utterances[split_idx].end);
+                    let split_idx = pick_split_index(&utterances);
+                    // Resume from the *raw* end of the chosen cue's last word, which by
+                    // timestamp contiguity is the next cue's start. The chosen cue's own
+                    // `end` is display-trimmed (trailing silence removed), so resuming
+                    // there would re-transcribe audio we already emitted captions for.
+                    // With a single cue there is no next cue; that's the hard-cut
+                    // fallback, where the trimmed end only re-covers inferred silence.
+                    let slice_at_secs = utterances
+                        .get(split_idx + 1)
+                        .map(|u| u.start)
+                        .unwrap_or(utterances[split_idx].end);
+                    let slice_at = start + Duration::from_secs_f64(slice_at_secs);
 
                     if verbose {
                         eprintln!(
@@ -958,7 +1332,10 @@ async fn main() -> anyhow::Result<()> {
                 "transcription produced no captions for the entire video; is the audio silent?"
             );
 
-            // Write the SRT file
+            // Write the SRT file. Cue text is kept single-line internally
+            // (progress messages quote it); the two-line wrapping happens
+            // only here, at serialization, where a '\n' inside the text
+            // block simply becomes the cue's second line.
             let mut outfile = tokio::fs::File::create(&srt).await.context("create srt")?;
             for (i, utterance) in captions.into_iter().enumerate() {
                 let line = format!(
@@ -967,7 +1344,7 @@ async fn main() -> anyhow::Result<()> {
                     i + 1,
                     format_srt_timestamp(utterance.start),
                     format_srt_timestamp(utterance.end),
-                    utterance.text,
+                    balance_lines(&utterance.text),
                 );
                 outfile
                     .write_all(line.as_bytes())
@@ -1073,5 +1450,378 @@ mod tests {
     fn pcm_truncated() {
         let err = pcm_f32le_to_samples(&[0, 0, 0]).unwrap_err();
         assert!(err.to_string().contains("not a whole number"));
+    }
+
+    // ------------------------------------------------------------------
+    // Cue building
+    // ------------------------------------------------------------------
+
+    /// Construct a word-level `Utterance`.
+    fn w(start: f64, end: f64, text: &str) -> Utterance {
+        Utterance {
+            start,
+            end,
+            text: text.to_string(),
+        }
+    }
+
+    /// Build contiguous word timestamps from text, one word every `pace`
+    /// seconds (mirroring Parakeet's contiguous token timestamps).
+    fn words_at_pace(text: &str, start: f64, pace: f64) -> Vec<Utterance> {
+        text.split_whitespace()
+            .enumerate()
+            .map(|(i, word)| w(start + i as f64 * pace, start + (i + 1) as f64 * pace, word))
+            .collect()
+    }
+
+    /// Every cue must wrap into at most two lines of at most
+    /// `MAX_LINE_CHARS` (the escape hatch for a lone over-long word is
+    /// exercised by a dedicated test, not by these fixtures).
+    fn assert_cue_fits_envelope(cue: &Utterance) {
+        let wrapped = balance_lines(&cue.text);
+        let lines: Vec<&str> = wrapped.split('\n').collect();
+        assert!(lines.len() <= 2, "too many lines: {wrapped:?}");
+        for line in lines {
+            assert!(
+                line.chars().count() <= MAX_LINE_CHARS,
+                "line too long: {line:?} in {wrapped:?}"
+            );
+        }
+        assert!(cue.end - cue.start <= MAX_CUE_SECS, "too slow: {cue:?}");
+    }
+
+    /// Invariants that must hold for any build_cues output: no dropped,
+    /// duplicated, or reordered words; sane, non-overlapping timestamps.
+    fn assert_cue_invariants(words: &[Utterance], cues: &[Utterance]) {
+        let original = words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rebuilt = cues
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(original, rebuilt, "cue text must round-trip the words");
+        for pair in cues.windows(2) {
+            assert!(
+                pair[0].start < pair[1].start,
+                "cue starts must strictly increase: {pair:?}"
+            );
+            assert!(
+                pair[0].end <= pair[1].start,
+                "cues must not overlap: {pair:?}"
+            );
+        }
+        for cue in cues {
+            assert!(cue.start < cue.end, "cue must have positive duration: {cue:?}");
+        }
+        if let (Some(first_word), Some(first_cue)) = (words.first(), cues.first()) {
+            assert_eq!(first_word.start, first_cue.start);
+        }
+    }
+
+    #[test]
+    fn cues_empty_input() {
+        assert!(build_cues(&[]).is_empty());
+    }
+
+    #[test]
+    fn cues_short_sentence_roundtrips() {
+        let words = words_at_pace("I think we might as well get started.", 0.5, 0.3);
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "I think we might as well get started.");
+        assert_eq!(cues[0].start, 0.5);
+    }
+
+    #[test]
+    fn cues_run_on_sentence_splits_at_commas() {
+        // ~200 chars of comma-separated clauses; every cue must fit the
+        // limits and every internal break must land on a comma.
+        let text = "as great as computers are in terms of being a tool, \
+                    they also have a tendency to do only exactly what we told them, \
+                    which is not necessarily what we intended for them to do, \
+                    and hence the need for debugging and profiling today.";
+        let words = words_at_pace(text, 0.0, 0.28);
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert!(cues.len() > 1, "a 200+ char sentence must split");
+        for cue in &cues {
+            assert_cue_fits_envelope(cue);
+        }
+        for cue in &cues[..cues.len() - 1] {
+            assert!(cue.text.ends_with(','), "break not at a comma: {cue:?}");
+        }
+    }
+
+    #[test]
+    fn cues_unpunctuated_stream_forced_breaks() {
+        let text = vec!["word"; 100].join(" ");
+        let words = words_at_pace(&text, 0.0, 0.3);
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        for cue in &cues {
+            assert!(!cue.text.is_empty());
+            assert_cue_fits_envelope(cue);
+        }
+    }
+
+    #[test]
+    fn cues_never_merge_sentences() {
+        // Both sentences would fit in one cue, but sentences stay separate.
+        let words = words_at_pace("Cool. So today we will talk about debugging.", 0.0, 0.3);
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "Cool.");
+        assert_eq!(cues[1].text, "So today we will talk about debugging.");
+    }
+
+    #[test]
+    fn cues_no_orphan_tail() {
+        // 18 unpunctuated 4-char words: too much for one cue, and every
+        // possible split costs the same BOUNDARY_NONE — without a
+        // char-based short-cue penalty, the tie used to resolve to a
+        // maximal first cue plus a lone-word crumb ("doing."-style tail).
+        let text = vec!["word"; 18].join(" ");
+        let words = words_at_pace(&text, 0.0, 0.3);
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert!(cues.len() > 1);
+        for cue in &cues {
+            assert!(
+                cue.text.chars().count() >= MIN_CUE_CHARS,
+                "crumb cue: {cue:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cues_trailing_pause_does_not_force_crumb() {
+        // A sentence long enough to need one split, whose final word
+        // absorbs a long silence (inflated raw end). The duration limit
+        // must be judged on the *displayed* (trimmed) cue, not the raw
+        // end — otherwise every multi-word tail candidate looks over-long
+        // and the sentence sheds a lone-word "doing."-style crumb cue
+        // before the pause.
+        let text = "stick a bunch of print statements that print out information \
+                    that helps you think through what the program is doing.";
+        let mut words = words_at_pace(text, 0.0, 0.3);
+        words.last_mut().expect("test text is non-empty").end += 6.0;
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert!(cues.len() > 1, "sentence over two lines' worth must split");
+        for cue in &cues {
+            assert!(
+                cue.text.chars().count() >= MIN_CUE_CHARS,
+                "crumb cue: {cue:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cues_split_when_no_balanced_break_exists() {
+        // Three 26-char words: 80 chars total — under two lines' worth of
+        // characters, but no word boundary splits it into two lines of ≤42
+        // (any split leaves one side at 53). The cue builder must therefore
+        // split it into two cues rather than emit an unwrappable one.
+        let long = "a".repeat(26);
+        let text = format!("{long} {long} {long}");
+        let words = words_at_pace(&text, 0.0, 0.8);
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert_eq!(cues.len(), 2);
+        for cue in &cues {
+            assert_cue_fits_envelope(cue);
+        }
+    }
+
+    #[test]
+    fn cues_lone_overlong_word_passes_through() {
+        let word = "a".repeat(100);
+        let words = vec![w(0.0, 2.0, &word)];
+        let cues = build_cues(&words);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, word);
+    }
+
+    #[test]
+    fn cues_split_at_inferred_pause_over_comma() {
+        // A sentence too long for one cue, containing both a comma boundary
+        // and (later) a word with heavily inflated duration (an absorbed
+        // pause). The pause must win as the split point, and the cue ending
+        // there must have its display time trimmed rather than lingering
+        // through the silence.
+        let mut words = words_at_pace(
+            "so this is where we get things like logging instead, \
+             and logging is really just a more principled use of print statements",
+            0.0,
+            0.28,
+        );
+        // Inflate "instead," (word index 9): 4s of absorbed silence. All
+        // later words shift by 4s to stay contiguous.
+        for word in &mut words[10..] {
+            word.start += 4.0;
+            word.end += 4.0;
+        }
+        words[9].end += 4.0;
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert!(
+            cues[0].text.ends_with("instead,"),
+            "should split at the pause: {cues:?}"
+        );
+        // Display end trimmed: near the estimated end of speech, far from
+        // the raw end (which extends 4s into the silence).
+        let last_word = &words[9];
+        let est_end = last_word.start + est_spoken_secs(&last_word.text) + CUE_LINGER_SECS;
+        assert!(
+            (cues[0].end - est_end).abs() < 1e-9,
+            "cue end {} should be trimmed to ~{est_end}",
+            cues[0].end
+        );
+        assert!(cues[0].end < last_word.end - 2.0);
+    }
+
+    #[test]
+    fn cues_avoid_breaking_after_function_word() {
+        // 18 unpunctuated words force one mid-clause split, and the
+        // no-penalty tie region is seeded with "the": the break must slide
+        // off the function word onto a content word.
+        let mut word_list = vec!["word"; 18];
+        word_list[12] = "them";
+        word_list[11] = "the";
+        let text = word_list.join(" ");
+        let words = words_at_pace(&text, 0.0, 0.3);
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert!(cues.len() > 1);
+        for cue in &cues[..cues.len() - 1] {
+            let last_word = cue.text.split(' ').next_back().expect("cue not empty");
+            assert_ne!(last_word, "the", "cue ends on a function word: {cue:?}");
+        }
+    }
+
+    #[test]
+    fn function_word_detection() {
+        assert!(is_function_word("the"));
+        assert!(is_function_word("The"));
+        assert!(is_function_word("we"));
+        // Trailing punctuation is stripped before matching (though callers
+        // treat punctuated boundaries as clause breaks first).
+        assert!(is_function_word("to"));
+        assert!(!is_function_word("computer"));
+        assert!(!is_function_word("debugging"));
+    }
+
+    #[test]
+    fn balance_avoids_breaking_after_function_word() {
+        // The most balanced split lands right after "the"; the break must
+        // move to a neighboring space instead.
+        let text = "they also have a tendency to do only the exact thing we told";
+        let wrapped = balance_lines(text);
+        let first_line = wrapped.split('\n').next().expect("has a line");
+        assert!(
+            !first_line.ends_with(" the") && !first_line.ends_with(" to"),
+            "line ends on a function word: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn sentence_end_detection() {
+        // Ordinary sentence ends, with and without a following word.
+        assert!(ends_sentence("started.", Some("If")));
+        assert!(ends_sentence("started.", None));
+        assert!(ends_sentence("right?", Some("Yes")));
+        assert!(ends_sentence("statements.\"", Some("And")));
+        // Abbreviations followed by a lowercase word are not sentence ends.
+        assert!(!ends_sentence("e.g.", Some("apples")));
+        assert!(!ends_sentence("Dr.", Some("who")));
+        // No sentence-final punctuation at all.
+        assert!(!ends_sentence("started", Some("If")));
+        assert!(!ends_sentence("started,", Some("If")));
+    }
+
+    // ------------------------------------------------------------------
+    // Line balancing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn balance_short_text_untouched() {
+        assert_eq!(balance_lines("I think we might get started."), "I think we might get started.");
+    }
+
+    #[test]
+    fn balance_long_text_two_lines() {
+        let text = "the biggest problem with print debugging is you start from scratch each time";
+        let wrapped = balance_lines(text);
+        let lines: Vec<&str> = wrapped.split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.chars().count() <= MAX_LINE_CHARS, "line too long: {line:?}");
+            assert!(!line.starts_with(' ') && !line.ends_with(' '));
+        }
+        assert_eq!(wrapped.replace('\n', " "), text, "wrapping must not alter words");
+    }
+
+    #[test]
+    fn balance_prefers_clause_punctuation_near_center() {
+        // The comma sits a little off-center; a pure balance split would
+        // break elsewhere, but the clause boundary should win.
+        let text = "they also have a tendency to do, only exactly what we told them to";
+        let wrapped = balance_lines(text);
+        assert_eq!(
+            wrapped,
+            "they also have a tendency to do,\nonly exactly what we told them to"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Segment split-point selection
+    //
+    // Parakeet fabricates sentence-final punctuation at hard cuts, so the
+    // very last caption must never be picked as the split point. That
+    // failure mode is pinned here.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn split_never_picks_last_caption() {
+        // The last caption ends with '.', but only because the hard cut made
+        // the model fabricate it; the comma-ended caption before it must win.
+        let utterances = vec![
+            w(0.0, 5.0, "we talked about logging levels,"),
+            w(5.0, 10.0, "and then the hard cut fabricated this."),
+        ];
+        assert_eq!(pick_split_index(&utterances), 0);
+    }
+
+    #[test]
+    fn split_prefers_sentence_end_over_recent_comma() {
+        let utterances = vec![
+            w(0.0, 5.0, "filler so the window has depth,"),
+            w(5.0, 10.0, "and this sentence ends properly."),
+            w(10.0, 15.0, "while this one trails off with a comma,"),
+            w(15.0, 20.0, "hard-cut tail caption."),
+        ];
+        assert_eq!(pick_split_index(&utterances), 1);
+    }
+
+    #[test]
+    fn split_prefers_recent_among_equal_punctuation() {
+        let utterances = vec![
+            w(0.0, 5.0, "an early complete sentence."),
+            w(5.0, 10.0, "a later complete sentence."),
+            w(10.0, 15.0, "hard-cut tail caption."),
+        ];
+        assert_eq!(pick_split_index(&utterances), 1);
+    }
+
+    #[test]
+    fn split_single_caption_hard_cut_fallback() {
+        let utterances = vec![w(0.0, 5.0, "only one caption here")];
+        assert_eq!(pick_split_index(&utterances), 0);
     }
 }
