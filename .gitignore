@@ -6,3 +6,5 @@
 *.mka
 *.wav
 *.m4a
+/tmp/
+SESSION.md
