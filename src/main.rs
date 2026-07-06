@@ -575,7 +575,8 @@ fn split_sentence_into_cues(sentence: &[Utterance], cues: &mut Vec<Utterance>) {
     let mut chars_before = Vec::with_capacity(n + 1);
     chars_before.push(0usize);
     for w in sentence {
-        chars_before.push(chars_before.last().expect("vec starts non-empty") + w.text.chars().count());
+        chars_before
+            .push(chars_before.last().expect("vec starts non-empty") + w.text.chars().count());
     }
     let cue_chars = |j: usize, i: usize| chars_before[i] - chars_before[j] + (i - j - 1);
 
@@ -629,8 +630,7 @@ fn split_sentence_into_cues(sentence: &[Utterance], cues: &mut Vec<Utterance>) {
                 }
             }
             let short_penalty = SHORT_CUE_PENALTY_PER_SEC * (MIN_CUE_SECS - duration).max(0.0)
-                + SHORT_CUE_PENALTY_PER_CHAR
-                    * MIN_CUE_CHARS.saturating_sub(cue_chars(j, i)) as f64;
+                + SHORT_CUE_PENALTY_PER_CHAR * MIN_CUE_CHARS.saturating_sub(cue_chars(j, i)) as f64;
             let cost = best[j] + short_penalty + break_cost;
             if cost < best[i] {
                 best[i] = cost;
@@ -1529,7 +1529,10 @@ mod tests {
             );
         }
         for cue in cues {
-            assert!(cue.start < cue.end, "cue must have positive duration: {cue:?}");
+            assert!(
+                cue.start < cue.end,
+                "cue must have positive duration: {cue:?}"
+            );
         }
         if let (Some(first_word), Some(first_cue)) = (words.first(), cues.first()) {
             assert_eq!(first_word.start, first_cue.start);
@@ -1765,7 +1768,10 @@ mod tests {
 
     #[test]
     fn balance_short_text_untouched() {
-        assert_eq!(balance_lines("I think we might get started."), "I think we might get started.");
+        assert_eq!(
+            balance_lines("I think we might get started."),
+            "I think we might get started."
+        );
     }
 
     #[test]
@@ -1775,10 +1781,17 @@ mod tests {
         let lines: Vec<&str> = wrapped.split('\n').collect();
         assert_eq!(lines.len(), 2);
         for line in &lines {
-            assert!(line.chars().count() <= MAX_LINE_CHARS, "line too long: {line:?}");
+            assert!(
+                line.chars().count() <= MAX_LINE_CHARS,
+                "line too long: {line:?}"
+            );
             assert!(!line.starts_with(' ') && !line.ends_with(' '));
         }
-        assert_eq!(wrapped.replace('\n', " "), text, "wrapping must not alter words");
+        assert_eq!(
+            wrapped.replace('\n', " "),
+            text,
+            "wrapping must not alter words"
+        );
     }
 
     #[test]
