@@ -11,32 +11,26 @@ ci = "github"
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
-# Build prebuilt binaries WITHOUT the default `webgpu` feature: it makes the
-# binary hard-depend on a separate libwebgpu_dawn.so that the shell installer
-# cannot ship ("throws out all files except for the binary"), and
-# aarch64-linux fails to link with it enabled (no WebGPU-enabled ONNX Runtime
-# prebuilt exists there). Prebuilt releases are therefore CPU-only and
-# self-contained; the README points users at building from source for GPU
-# inference.
-#
-# Two upstream developments would unlock GPU prebuilts; watch both:
-# - ort linking Dawn statically ("cannot be linked statically *yet*" per
-#   ort-sys). Dawn itself supports a monolithic static build, and Microsoft's
-#   official ONNX Runtime builds already link it statically — the dynamic
-#   libwebgpu_dawn.so is specific to pyke's binary distribution (see
-#   https://github.com/pykeio/ort/issues/538); no dedicated pykeio/ort issue
-#   tracks changing that.
-# - cargo-dist installing arbitrary shared libraries alongside binaries:
-#   https://github.com/axodotdev/cargo-dist/issues/542 (closest match),
-#   https://github.com/axodotdev/cargo-dist/issues/383, with groundwork in
-#   https://github.com/axodotdev/cargo-dist/issues/934 and
-#   https://github.com/axodotdev/cargo-dist/issues/1233 — all open; the
-#   existing `install-libraries` option only covers workspace cdylibs.
-#
-# NOTE: the aarch64 build (CPU-only ort prebuilt, downloaded by ort-sys's
-# build script in CI) is unverified until the first release CI run.
-default-features = false
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+
+# Prebuilt binaries include the Vulkan GPU backend: ggml links it statically
+# (unlike the ONNX era's separate libwebgpu_dawn.so, which release installers
+# could not ship), so the binaries stay self-contained. Building it needs the
+# Vulkan development bits on the CI runner, declared here.
+#
+# NOTE: unverified until the first release CI run:
+# - whether a Vulkan-enabled binary starts on a machine *without*
+#   libvulkan.so.1 installed (ggml is expected to fall back to CPU; if the
+#   dynamic loader dependency turns out to be hard, revisit with
+#   transcribe-cpp's `dynamic-backends` feature or a CPU-only artifact);
+# - the aarch64 build (runs on GitHub's native arm runners, so no
+#   cross-compiling of the C++ core is involved — but it has never been
+#   exercised).
+[dist.dependencies.apt]
+cmake = '*'
+libvulkan-dev = '*'
+spirv-headers = '*'
+glslc = '*'

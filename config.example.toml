@@ -5,16 +5,15 @@
 #   macOS:   ~/Library/Application Support/sirtea/config.toml
 #   Windows: C:\Users\<user>\AppData\Roaming\sirtea\config.toml
 
-# Optional: Directory holding the Parakeet model files
-# (encoder-model.int8.onnx, decoder_joint-model.int8.onnx, nemo128.onnx,
-# vocab.txt from https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx).
+# Optional: Path to the Parakeet GGUF model file (any quantization from
+# https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf works; a
+# directory containing parakeet-tdt-0.6b-v3-Q8_0.gguf is also accepted).
 # Default: unset, meaning the model is downloaded automatically on first run
 # into the per-user data dir (e.g. ~/.local/share/sirtea/models/ on Linux).
-# model_path = "/path/to/parakeet-model"
+# model_path = "/path/to/parakeet-tdt-0.6b-v3-Q8_0.gguf"
 
 # Optional: Maximum segment length in seconds before splitting
-# The bundled Parakeet model accepts at most ~200 seconds of audio per
-# inference call, so this cannot be raised meaningfully; lowering it mainly
-# reduces memory use.
-# Default: 195 (3m15s)
+# Default: the model's own per-inference-call audio limit, queried at
+# startup. Values above that limit are rejected; lowering it mainly reduces
+# memory use.
 # segment_length = 195

@@ -16,25 +16,24 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use tokio::io::AsyncWriteExt;
-use transcribe_rs::accel::{set_ort_accelerator, OrtAccelerator};
-use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity};
-use transcribe_rs::onnx::Quantization;
+use transcribe_cpp::{disable_logging, init_backends_default, Model, RunOptions, TimestampKind};
 use walkdir::WalkDir;
 
-// The ONNX export of Parakeet we use bakes a relative-position table sized for
-// 2504 encoder frames into the model, and one frame covers 80ms of audio, so a
-// single inference call can accept at most ~200 seconds of audio; the encoder
-// errors out beyond that ("Attempting to broadcast an axis by a dimension other
-// than 1. 2504 by N"). We therefore split long videos into segments and stitch
-// the transcripts back together at natural sentence boundaries (see the
-// split-point logic in `main`). transcribe-rs also prepends 250ms of silence to
-// every call, so the default stays a few seconds under the true ceiling.
-const DEFAULT_MAX_SEGMENT_LENGTH: f64 = 195.0; // 3m15s
+// Long videos are split into segments and the transcripts stitched back
+// together at natural sentence boundaries (see the split-point logic in
+// `main`). The model's own per-inference-call audio ceiling is queried at
+// runtime from `Session::limits()` and used as the default segment length;
+// this constant is the fallback for when the model reports no practical
+// limit, chosen to keep per-segment memory bounded and progress updates
+// frequent. (Its specific value is a holdover from the ONNX era, when the
+// Parakeet export's baked positional table capped a call at ~200s.)
+const FALLBACK_MAX_SEGMENT_LENGTH: f64 = 195.0; // 3m15s
 
 // Rough CPU inference throughput, used only for --dry-run time estimates.
-// Measured end-to-end (extraction + inference) at ~5.9x realtime on a 32-core
-// Zen 3; transcribe-rs quotes 20-30x on other hardware, so this is conservative.
-const ESTIMATED_REALTIME_FACTOR: f64 = 6.0;
+// Measured end-to-end (extraction + inference) at ~19.5x realtime on a
+// 32-core Zen 3 with the ggml CPU backend (2026-07); kept below the
+// measurement so the estimate errs pessimistic on smaller machines.
+const ESTIMATED_REALTIME_FACTOR: f64 = 15.0;
 
 // ============================================================================
 // Cue shaping constants (see the cue-building section below for the
@@ -100,19 +99,15 @@ const PAUSE_MIN_SECS: f64 = 0.8;
 /// so trimmed cues don't vanish the instant the voice stops.
 const CUE_LINGER_SECS: f64 = 0.5;
 
-/// The HuggingFace repository holding the ONNX export of Parakeet that we use.
-const MODEL_REPO: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
+/// The HuggingFace repository holding the GGUF conversion of Parakeet that we
+/// use (converted and tested by the transcribe.cpp authors).
+const MODEL_REPO: &str = "handy-computer/parakeet-tdt-0.6b-v3-gguf";
 
-/// The files `ParakeetModel::load` opens from the model directory, using the
-/// int8 quantization (fast on CPU, and a ~670MB download instead of ~2.5GB).
-/// These names must match exactly: transcribe-rs silently falls back to the
-/// fp32 `encoder-model.onnx` if the int8 file is missing.
-const MODEL_FILES: &[&str] = &[
-    "encoder-model.int8.onnx",
-    "decoder_joint-model.int8.onnx",
-    "nemo128.onnx",
-    "vocab.txt",
-];
+/// The single GGUF file we download from `MODEL_REPO`. Q8_0 matches the
+/// accuracy posture of the int8 ONNX export earlier versions used (~740MB
+/// download instead of ~2.5GB for F32). Other quantizations from the same
+/// repo work too if the user points `model_path` at one.
+const MODEL_FILE: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
 
 /// Command-line arguments.
 struct Args {
@@ -190,9 +185,9 @@ fn print_help() {
 {name} {version}
 Generate SRT subtitle files from video using local speech-to-text.
 
-Transcription runs fully locally using NVIDIA's Parakeet model via ONNX
-Runtime; no audio ever leaves your machine. On first run, the model files
-(~670 MB) are downloaded from https://huggingface.co/{model_repo}.
+Transcription runs fully locally using NVIDIA's Parakeet model via
+transcribe.cpp (ggml); no audio ever leaves your machine. On first run, the
+model (~740 MB) is downloaded from https://huggingface.co/{model_repo}.
 
 USAGE:
     {name} [OPTIONS] <PATH>...
@@ -203,12 +198,12 @@ ARGS:
 OPTIONS:
     -h, --help                  Print help information
     -V, --version               Print version information
-        --model <DIR>           Directory holding the Parakeet model files
+        --model <FILE>          Path to the Parakeet GGUF model file, or a
+                                directory containing {model_file}
                                 (default: auto-download to the user data dir)
-        --segment-length <SEC>  Max segment length in seconds (default: {segment_length})
-                                The Parakeet model accepts at most ~200 seconds of
-                                audio per inference call, so this cannot be raised
-                                meaningfully; lowering it mainly reduces memory use.
+        --segment-length <SEC>  Max segment length in seconds (default: the
+                                model's own per-inference-call audio limit;
+                                lowering it mainly reduces memory use)
         --dry-run               List what would be transcribed without transcribing
     -q, --quiet                 Minimal output (errors only)
     -v, --verbose               Print split point details when segmenting long videos
@@ -225,7 +220,7 @@ REQUIREMENTS:
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         model_repo = MODEL_REPO,
-        segment_length = DEFAULT_MAX_SEGMENT_LENGTH,
+        model_file = MODEL_FILE,
     );
 }
 
@@ -254,12 +249,14 @@ fn model_data_dir() -> Option<PathBuf> {
 
 /// Directory name for the model under `model_data_dir`. Kept in sync with
 /// MODEL_REPO so a future model upgrade lands in a fresh directory rather than
-/// mixing files from two exports.
-const MODEL_REPO_DIRNAME: &str = "parakeet-tdt-0.6b-v3-int8";
+/// mixing files from two exports. (The ONNX era used
+/// `parakeet-tdt-0.6b-v3-int8`; that directory is simply left behind and can
+/// be deleted to reclaim ~670MB.)
+const MODEL_REPO_DIRNAME: &str = "parakeet-tdt-0.6b-v3-gguf";
 
-/// Check whether all required model files are present in `dir`.
-fn model_files_present(dir: &Path) -> bool {
-    MODEL_FILES.iter().all(|f| dir.join(f).exists())
+/// Check whether the model file is present in `dir`.
+fn model_file_present(dir: &Path) -> bool {
+    dir.join(MODEL_FILE).exists()
 }
 
 /// Load configuration from the appropriate location.
@@ -297,55 +294,58 @@ async fn check_external_tool(name: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Figure out where the model files live, downloading them if necessary.
+/// Figure out where the model file lives, downloading it if necessary.
 ///
-/// An explicitly configured directory (--model or model_path in the config) is
+/// An explicitly configured path (--model or model_path in the config) is
 /// trusted but verified: we never download into it, and error with pointers if
-/// files are missing. Otherwise we use the per-user data dir and download the
-/// model on first use.
-async fn resolve_model_dir(explicit: Option<PathBuf>, quiet: bool) -> anyhow::Result<PathBuf> {
-    if let Some(dir) = explicit {
-        for file in MODEL_FILES {
-            anyhow::ensure!(
-                dir.join(file).exists(),
-                "model file '{}' not found in '{}'; download the files {} \
-                 from https://huggingface.co/{}",
-                file,
-                dir.display(),
-                MODEL_FILES.join(", "),
-                MODEL_REPO,
-            );
+/// the file is missing. A file path is used as-is (any GGUF quantization of
+/// Parakeet works); a directory is accepted for compatibility with the
+/// auto-download layout and must contain `MODEL_FILE`. Otherwise we use the
+/// per-user data dir and download the model on first use.
+async fn resolve_model_path(explicit: Option<PathBuf>, quiet: bool) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        if path.is_file() {
+            return Ok(path);
         }
-        return Ok(dir);
+        let in_dir = path.join(MODEL_FILE);
+        anyhow::ensure!(
+            in_dir.exists(),
+            "model file '{}' not found in '{}'. Note that sirtea now uses GGUF \
+             weights (earlier versions used ONNX files, which no longer work \
+             and can be deleted); point --model/model_path at a .gguf file, or \
+             download {} from https://huggingface.co/{}",
+            MODEL_FILE,
+            path.display(),
+            MODEL_FILE,
+            MODEL_REPO,
+        );
+        return Ok(in_dir);
     }
 
     let dir = model_data_dir().context("determine per-user model data directory")?;
-    if model_files_present(&dir) {
-        return Ok(dir);
+    if !model_file_present(&dir) {
+        let config_path = config_dir()
+            .map(|d| d.join("config.toml").display().to_string())
+            .unwrap_or_else(|| "~/.config/sirtea/config.toml".to_string());
+        download_model(&dir, quiet).await.with_context(|| {
+            format!(
+                "download the Parakeet model from https://huggingface.co/{MODEL_REPO}; \
+                 if you are offline, download {MODEL_FILE} manually \
+                 and set model_path in {config_path}"
+            )
+        })?;
     }
-
-    let config_path = config_dir()
-        .map(|d| d.join("config.toml").display().to_string())
-        .unwrap_or_else(|| "~/.config/sirtea/config.toml".to_string());
-    download_model(&dir, quiet).await.with_context(|| {
-        format!(
-            "download the Parakeet model from https://huggingface.co/{MODEL_REPO}; \
-             if you are offline, download the files {} manually into a directory \
-             and set model_path in {config_path}",
-            MODEL_FILES.join(", "),
-        )
-    })?;
-    Ok(dir)
+    Ok(dir.join(MODEL_FILE))
 }
 
-/// Download the model files from HuggingFace into `target`.
+/// Download the model file from HuggingFace into `target`.
 ///
-/// Files are downloaded into a sibling `.tmp` directory that is renamed into
-/// place only once every file completed, so an interrupted download can never
-/// leave a directory that passes the `model_files_present` check with
-/// truncated weights in it.
+/// The file is downloaded into a sibling `.tmp` directory that is renamed
+/// into place only once the download completed, so an interrupted download
+/// can never leave a directory that passes the `model_file_present` check
+/// with truncated weights in it.
 async fn download_model(target: &Path, quiet: bool) -> anyhow::Result<()> {
-    // TODO: pin sha256 digests for the model files instead of trusting
+    // TODO: pin a sha256 digest for the model file instead of trusting
     // HuggingFace + TLS alone.
     let tmp_name = target
         .file_name()
@@ -367,53 +367,51 @@ async fn download_model(target: &Path, quiet: bool) -> anyhow::Result<()> {
     }
 
     let client = reqwest::Client::new();
-    for file in MODEL_FILES {
-        let url = format!("https://huggingface.co/{MODEL_REPO}/resolve/main/{file}");
-        let mut resp = client
-            .get(&url)
-            .send()
-            .await
-            .and_then(|resp| resp.error_for_status())
-            .with_context(|| format!("fetch '{url}'"))?;
+    let url = format!("https://huggingface.co/{MODEL_REPO}/resolve/main/{MODEL_FILE}");
+    let mut resp = client
+        .get(&url)
+        .send()
+        .await
+        .and_then(|resp| resp.error_for_status())
+        .with_context(|| format!("fetch '{url}'"))?;
 
-        let progress_bar = if quiet {
-            None
-        } else {
-            let pb = match resp.content_length() {
-                Some(len) => ProgressBar::new(len).with_style(
-                    ProgressStyle::with_template(
-                        "{prefix} {bar:30} {bytes}/{total_bytes} ({bytes_per_sec})",
-                    )
-                    .expect("valid template"),
-                ),
-                None => ProgressBar::new_spinner(),
-            };
-            pb.set_prefix(*file);
-            Some(pb)
+    let progress_bar = if quiet {
+        None
+    } else {
+        let pb = match resp.content_length() {
+            Some(len) => ProgressBar::new(len).with_style(
+                ProgressStyle::with_template(
+                    "{prefix} {bar:30} {bytes}/{total_bytes} ({bytes_per_sec})",
+                )
+                .expect("valid template"),
+            ),
+            None => ProgressBar::new_spinner(),
         };
+        pb.set_prefix(MODEL_FILE);
+        Some(pb)
+    };
 
-        let out_path = tmp.join(file);
-        let mut out = tokio::fs::File::create(&out_path)
+    let out_path = tmp.join(MODEL_FILE);
+    let mut out = tokio::fs::File::create(&out_path)
+        .await
+        .with_context(|| format!("create '{}'", out_path.display()))?;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("download '{url}'"))?
+    {
+        out.write_all(&chunk)
             .await
-            .with_context(|| format!("create '{}'", out_path.display()))?;
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .with_context(|| format!("download '{url}'"))?
-        {
-            out.write_all(&chunk)
-                .await
-                .with_context(|| format!("write to '{}'", out_path.display()))?;
-            if let Some(ref pb) = progress_bar {
-                pb.inc(chunk.len() as u64);
-            }
+            .with_context(|| format!("write to '{}'", out_path.display()))?;
+        if let Some(ref pb) = progress_bar {
+            pb.inc(chunk.len() as u64);
         }
-        out.flush()
-            .await
-            .with_context(|| format!("flush '{}'", out_path.display()))?;
-        if let Some(pb) = progress_bar {
-            pb.finish();
-        }
+    }
+    out.flush()
+        .await
+        .with_context(|| format!("flush '{}'", out_path.display()))?;
+    if let Some(pb) = progress_bar {
+        pb.finish();
     }
 
     std::fs::rename(&tmp, target).context("move completed model download into place")?;
@@ -795,6 +793,22 @@ struct LocalVideo {
     delay: Duration,
 }
 
+/// Reject a segment length that doesn't clear a video's audio start delay
+/// (see the call sites for why that combination cannot work).
+fn ensure_segment_clears_delay(
+    segment_length: f64,
+    delay: Duration,
+    path: &Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        segment_length > delay.as_secs_f64(),
+        "segment length ({segment_length}s) must exceed the audio start delay ({:.3}s) of '{}'",
+        delay.as_secs_f64(),
+        path.display()
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = parse_args().context("parse arguments")?;
@@ -809,12 +823,12 @@ async fn main() -> anyhow::Result<()> {
 
     let config = load_config()?;
 
-    // Merge config with CLI args (CLI takes precedence, then config, then defaults)
-    let segment_length = args
-        .segment_length
-        .or(config.segment_length)
-        .unwrap_or(DEFAULT_MAX_SEGMENT_LENGTH);
-    let model_dir_override = args.model.or(config.model_path);
+    // Merge config with CLI args (CLI takes precedence, then config). The
+    // segment-length *default* comes from the model's own per-call audio
+    // limit, which is only known once the transcription session exists, so
+    // "not explicitly set" survives as None until then.
+    let user_segment_length = args.segment_length.or(config.segment_length);
+    let model_path_override = args.model.or(config.model_path);
 
     // Collect all candidate file paths, expanding directories with WalkDir.
     // Track whether each path was explicitly specified (should error on failure)
@@ -930,17 +944,16 @@ async fn main() -> anyhow::Result<()> {
         // Segment 0's ffmpeg `-t` is `segment_length - delay` (the adelay
         // filter pads the front with silence, so we consume correspondingly
         // less input), which would go to zero or negative if the segment
-        // length doesn't clear the delay. Catch that here, where both values
-        // are first known, rather than letting ffmpeg fail opaquely mid-run.
-        // Delays are normally milliseconds, so this only fires on a
-        // pathological --segment-length. This also rejects a non-positive or
-        // NaN segment length, since `delay` is always >= 0.
-        anyhow::ensure!(
-            segment_length > delay.as_secs_f64(),
-            "segment length ({segment_length}s) must exceed the audio start delay ({:.3}s) of '{}'",
-            delay.as_secs_f64(),
-            path.display()
-        );
+        // length doesn't clear the delay. Catch an explicitly-set length
+        // here, where both values are first known, rather than letting
+        // ffmpeg fail opaquely mid-run; the model-derived default is checked
+        // the same way once the session exists. Delays are normally
+        // milliseconds, so this only fires on a pathological
+        // --segment-length. This also rejects a non-positive or NaN segment
+        // length, since `delay` is always >= 0.
+        if let Some(segment_length) = user_segment_length {
+            ensure_segment_clears_delay(segment_length, delay, &path)?;
+        }
         videos.insert(LocalVideo {
             length,
             path,
@@ -967,15 +980,15 @@ async fn main() -> anyhow::Result<()> {
             "Estimated processing time: {:.1} minutes (at ~{ESTIMATED_REALTIME_FACTOR:.0}x realtime)",
             total_seconds / ESTIMATED_REALTIME_FACTOR / 60.0
         );
-        let model_present = match &model_dir_override {
-            Some(dir) => model_files_present(dir),
+        let model_present = match &model_path_override {
+            Some(path) => path.is_file() || model_file_present(path),
             None => model_data_dir()
-                .map(|d| model_files_present(&d))
+                .map(|d| model_file_present(&d))
                 .unwrap_or(false),
         };
         if !model_present {
             println!(
-                "Note: the first real run will download the Parakeet model (~670 MB) \
+                "Note: the first real run will download the Parakeet model (~740 MB) \
                  from https://huggingface.co/{MODEL_REPO}"
             );
         }
@@ -985,28 +998,71 @@ async fn main() -> anyhow::Result<()> {
     // Get the model ready before starting on any video so that configuration
     // problems (or a failed download) surface immediately rather than after
     // minutes of audio extraction.
-    let model_dir = resolve_model_dir(model_dir_override, args.quiet).await?;
+    let model_path = resolve_model_path(model_path_override, args.quiet).await?;
 
-    // Run inference on the GPU via ONNX Runtime's WebGPU execution provider
-    // (works on AMD and NVIDIA alike; compiled in via the default `webgpu`
-    // cargo feature — prebuilt release binaries disable it and stay on CPU).
-    // WebGPU must be selected explicitly, and before the sessions are
-    // created below: transcribe-rs's default `Auto` mode never picks it,
-    // because WebGPU forces sequential session execution, which upstream
-    // won't impose on other backends. This is safe to set unconditionally:
-    // builds without the feature, and machines without a working GPU/Vulkan
-    // stack, fall back to CPU at session creation.
-    set_ort_accelerator(OrtAccelerator::WebGpu);
-    let webgpu_compiled_in = OrtAccelerator::available().contains(&OrtAccelerator::WebGpu);
+    // The native library logs diagnostics (per-run decoder stats, feature
+    // warnings) straight to stderr by default, which would tear through the
+    // indicatif progress bars mid-line. Keep them only in verbose mode,
+    // where detail is the point.
+    if !args.verbose {
+        disable_logging();
+    }
+
+    // The ggml compute backends are compiled in statically (Vulkan on Linux,
+    // Metal on macOS — see Cargo.toml), so this is currently a no-op, but the
+    // crate asks for it to run once before the first model load, and it is
+    // where dynamically-loaded backend modules would be discovered.
+    init_backends_default().context("initialize ggml compute backends")?;
 
     if !args.quiet {
+        eprintln!("loading Parakeet model…");
+    }
+    let model = Model::load(&model_path)
+        .with_context(|| format!("load Parakeet model from '{}'", model_path.display()))?;
+    if !args.quiet {
+        // backend() names what inference will actually run on ("vulkan",
+        // "metal", "cpu", ...) — a GPU build on a machine without a usable
+        // GPU visibly reports its CPU fallback here.
+        eprintln!("inference backend: {}", model.backend());
+    }
+    let mut session = model.session().context("create transcription session")?;
+
+    // The model itself states how much audio it accepts per inference call,
+    // and that — not a compile-time constant — is the natural default segment
+    // length: fewer splits means fewer chances for an awkward stitch. An
+    // explicit --segment-length/config value wins, but erroring (rather than
+    // silently clamping) when it exceeds the model's limit keeps the user's
+    // segmentation choice honest.
+    let limits = session.limits().context("query model session limits")?;
+    if args.verbose {
         eprintln!(
-            "loading Parakeet model…{}",
-            if webgpu_compiled_in { " (WebGPU)" } else { "" }
+            "model limits: n_ctx={}, max_audio_ms={}",
+            limits.effective_n_ctx, limits.effective_max_audio_ms
         );
     }
-    let mut model = ParakeetModel::load(&model_dir, &Quantization::Int8)
-        .with_context(|| format!("load Parakeet model from '{}'", model_dir.display()))?;
+    let model_max =
+        (limits.effective_max_audio_ms > 0).then(|| limits.effective_max_audio_ms as f64 / 1000.0);
+    let segment_length = match user_segment_length {
+        Some(len) => {
+            if let Some(max) = model_max {
+                anyhow::ensure!(
+                    len <= max,
+                    "segment length ({len}s) exceeds what the model accepts \
+                     per inference call ({max:.0}s)"
+                );
+            }
+            len
+        }
+        // 0 means "no practical limit"; fall back to a constant so segments
+        // stay bounded (memory, progress cadence) even then.
+        None => model_max.unwrap_or(FALLBACK_MAX_SEGMENT_LENGTH),
+    };
+    // Explicitly-set segment lengths were validated against each video's
+    // audio start delay during probing; the model-derived default is only
+    // known now, so give it the same check before any work starts.
+    for video in &videos {
+        ensure_segment_clears_delay(segment_length, video.delay, &video.path)?;
+    }
 
     // Set up progress tracking
     let multi_progress = if args.quiet {
@@ -1045,24 +1101,28 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    // Process videos one at a time; sequential keeps the code (and the progress
-    // story) simple. Measured on a 16-core machine, inference averages only ~5
-    // busy cores: Parakeet TDT's decode loop is inherently serial (one tiny
-    // decoder_joint inference per 80ms audio frame, thousands per segment) and
-    // bounds the critical path, while the encoder's parallel sections are too
-    // short to saturate ONNX Runtime's thread pools. Transcribing videos
-    // concurrently would therefore raise throughput, but at ~5GB RAM per
-    // in-flight inference; revisit if sequential ever feels too slow.
+    // Process videos one at a time; sequential keeps the code (and the
+    // progress story) simple, and transcribe.cpp enforces it anyway: the
+    // native library allows at most one in-flight run per loaded model, so
+    // concurrency would require loading a second copy of the ~740MB weights
+    // per parallel video. Revisit if sequential ever feels too slow.
     // TODO: overlap the *extraction* of the next segment with inference of the
     // current one if profiling ever shows extraction to be a meaningful share.
-    // NOTE: transcribe-rs ships its own chunked-transcription wrappers
-    // (`transcribe_rs::transcriber::{EnergyAdaptiveChunked, VadChunked}`)
-    // that split long audio internally (energy/VAD-based split-point search)
-    // and merge the results — conceptually overlapping the segment/split
-    // machinery below. Ours picks sentence boundaries from the transcript
-    // itself rather than energy dips, which gives arguably better splits, but
-    // if this file ever needs to shrink, replacing the segment loop with
-    // `EnergyAdaptiveChunked` is worth evaluating.
+
+    // Word-level timestamps: build_cues re-groups words into subtitle-sized
+    // cues. (Segment-level timestamps split only at sentence-final
+    // punctuation, which produces cues far too long to read; see the
+    // cue-building section.) `pnc` stays at the family default: sentence
+    // detection (`ends_sentence`) depends on punctuation, but Parakeet
+    // punctuates by default and does not support runtime PNC control —
+    // requesting `On` only triggers a native warning per inference call
+    // (verified against transcribe.cpp 0.1.1).
+    let run_opts = RunOptions {
+        timestamps: TimestampKind::Word,
+        language: None, // auto-detect
+        ..RunOptions::default()
+    };
+
     for (video, video_name, progress_bar) in videos {
         let verbose = args.verbose;
         let result: anyhow::Result<()> = async {
@@ -1085,10 +1145,10 @@ async fn main() -> anyhow::Result<()> {
                 pb.enable_steady_tick(Duration::from_millis(120));
             }
 
-            // Split long videos into segments to bound Parakeet's memory use
-            // (see the comment on DEFAULT_MAX_SEGMENT_LENGTH). Note that this
-            // must be an open-ended loop rather than iterating over a segment
-            // count computed up front: every split point slides `start`
+            // Split long videos into segments the model can accept per
+            // inference call (see the segment-length resolution above the
+            // video loop). Note that this must be an open-ended loop rather
+            // than iterating over a segment count computed up front: every split point slides `start`
             // backwards to a sentence boundary, and over many segments that
             // slippage adds up to extra segments at the end.
             let mut start = Duration::default();
@@ -1223,29 +1283,23 @@ async fn main() -> anyhow::Result<()> {
                 // runtime. That's fine — and not worth "fixing": nothing else
                 // needs to make progress during inference (the progress bars
                 // tick on their own thread).
-                let transcription = model
-                    .transcribe_with(
-                        &samples,
-                        &ParakeetParams {
-                            language: None,
-                            // Word granularity gives per-word timestamps,
-                            // which build_cues re-groups into subtitle-sized
-                            // cues. (Parakeet's own Segment granularity
-                            // splits only at sentence-final punctuation,
-                            // which produces cues far too long to read; see
-                            // the cue-building section.)
-                            timestamp_granularity: Some(TimestampGranularity::Word),
-                        },
-                    )
+                let transcript = session
+                    .run(&samples, &run_opts)
                     .context("transcribe audio segment")?;
-                let words: Vec<Utterance> = transcription
-                    .segments
-                    .unwrap_or_default()
+                let words: Vec<Utterance> = transcript
+                    .words
                     .into_iter()
-                    .map(|s| Utterance {
-                        start: f64::from(s.start),
-                        end: f64::from(s.end),
-                        text: s.text,
+                    .filter_map(|w| {
+                        // Word rows may carry the tokenizer's leading space;
+                        // trim so character counts (est_spoken_secs, line
+                        // layout) stay correct, and drop anything that trims
+                        // to empty.
+                        let text = w.text.trim().to_string();
+                        (!text.is_empty()).then(|| Utterance {
+                            start: w.t0_ms as f64 / 1000.0,
+                            end: w.t1_ms as f64 / 1000.0,
+                            text,
+                        })
                     })
                     .collect();
                 let mut utterances = build_cues(&words);
@@ -1377,31 +1431,11 @@ async fn main() -> anyhow::Result<()> {
         result.with_context(|| format!("while transcribing {}", video_name))?;
     }
 
-    // Skip all teardown. ONNX Runtime's WebGPU provider is buggy on shutdown:
-    // destroying the Dawn device segfaults when a GPU was in use, and spins
-    // forever when device enumeration failed (observed with ONNX Runtime
-    // 1.24.2 prebuilts). The spin lives in an atexit-registered C++ static
-    // destructor, so `std::process::exit` (which runs atexit handlers) is not
-    // enough — terminate with the raw `_exit` syscall instead. Every output
-    // is already written and flushed by this point, so skipping destructors
-    // and atexit handlers is safe; this is the standard workaround for this
-    // class of GPU-runtime teardown bug.
-    //
-    // Upstream status (as of 2026-07): the exit crash is fixed by
-    // https://github.com/microsoft/onnxruntime/pull/27569 (merged 2026-03,
-    // after the 1.24.x branch). When transcribe-rs/ort move to an ONNX
-    // Runtime that contains that fix, remove this workaround (after
-    // confirming the no-Vulkan atexit spin is gone too — that one appears
-    // unreported upstream as of 2026-07).
-    //
-    // The error path (an `Err` return from `main`) still runs normal teardown
-    // and may crash or hang *after* the error message has been printed.
-    // That's cosmetic — the user has their error by then — and accepted to
-    // keep error propagation ordinary.
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    unsafe { libc::_exit(0) }
+    // Note there is deliberately no teardown trickery here. The ONNX-era
+    // builds had to skip destructors with a raw `_exit` because ONNX
+    // Runtime's WebGPU provider segfaulted or deadlocked in atexit handlers;
+    // ggml has no such shutdown bug, so plain, ordinary teardown is back.
+    Ok(())
 }
 
 fn format_srt_timestamp(total_seconds: f64) -> String {

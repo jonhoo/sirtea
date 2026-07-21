@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 `sirtea` is a CLI tool that transcribes video files to SRT subtitle files
-using NVIDIA's Parakeet speech-to-text model, run fully locally via ONNX
-Runtime (through the `transcribe-rs` crate). Accepts any video filename;
-outputs `<basename>.srt` alongside the input.
+using NVIDIA's Parakeet speech-to-text model, run fully locally via
+transcribe.cpp/ggml (through the `transcribe-cpp` crate). Accepts any video
+filename; outputs `<basename>.srt` alongside the input.
 
 For background on why this tool exists, see [the blog post](https://thesquareplanet.com/blog/ai-captioning/)
 (written when the tool still used the Gladia cloud API; the segmentation
@@ -32,10 +32,11 @@ Configuration is optional. Config file at the XDG config path:
 See `config.example.toml` for available options (`model_path`,
 `segment_length`).
 
-The Parakeet model files (~670 MB) are auto-downloaded on first run from
-HuggingFace (`istupakov/parakeet-tdt-0.6b-v3-onnx`) into the per-user data
-dir (Linux: `~/.local/share/sirtea/models/`), unless `model_path`/`--model`
-points at an existing model directory.
+The Parakeet model (a single ~740 MB GGUF file) is auto-downloaded on first
+run from HuggingFace (`handy-computer/parakeet-tdt-0.6b-v3-gguf`) into the
+per-user data dir (Linux: `~/.local/share/sirtea/models/`), unless
+`model_path`/`--model` points at an existing `.gguf` file (or a directory
+containing the default one).
 
 ## Architecture
 
@@ -43,18 +44,18 @@ Single-file async Rust application (`src/main.rs`) that:
 
 1. **Discovers files** - Accepts video files or directories; recurses directories with `walkdir`
 2. **Probes media** - Uses `symphonia` to read audio track metadata (duration, sample rate)
-3. **Ensures the model** - Downloads the int8 Parakeet ONNX model on first run (atomic: downloads to a `.tmp` dir, renames into place)
+3. **Ensures the model** - Downloads the Q8_0 Parakeet GGUF model on first run (atomic: downloads to a `.tmp` dir, renames into place)
 4. **Extracts audio** - Uses ffmpeg to decode to raw 16 kHz mono f32 PCM, buffered in memory per segment
-5. **Handles long videos** - Splits videos exceeding `DEFAULT_MAX_SEGMENT_LENGTH` into chunks (the Parakeet ONNX export accepts at most ~200s of audio per inference call), preferring sentence-final punctuation for clean splits (Parakeet's token timestamps are contiguous, so there are no silence gaps to detect)
-6. **Transcribes locally** - Runs Parakeet inference via `transcribe-rs` with `TimestampGranularity::Word`, one video at a time; uses the GPU automatically via ONNX Runtime's WebGPU execution provider (selected explicitly in `main` — transcribe-rs's `Auto` mode never picks WebGPU), falling back to CPU when no GPU/Vulkan stack is available
+5. **Handles long videos** - Splits videos exceeding the segment length into chunks (default: the model's per-inference-call audio limit from `Session::limits()`), preferring sentence-final punctuation for clean splits (Parakeet's token timestamps are contiguous, so there are no silence gaps to detect)
+6. **Transcribes locally** - Runs Parakeet inference via `transcribe-cpp` with `TimestampKind::Word`, one video at a time (transcribe.cpp allows only one in-flight run per loaded model anyway); the GPU backend is compiled in per-OS (Vulkan on Linux, Metal on macOS — see the target-specific dependency tables in `Cargo.toml`), falling back to CPU at runtime when no usable GPU is present
 7. **Builds cues** - `build_cues` re-groups word timestamps into subtitle-sized cues (at most two 42-char lines, ≤7s): sentences never merge, over-long sentences split via a Knuth-Plass-style DP preferring clause punctuation and inferred pauses (contiguous timestamps absorb silence into the preceding word, so inflated word durations reveal pauses), and cue display times are trimmed so captions don't linger through silence
 8. **Outputs SRT** - Writes captions with timestamps, wrapping cue text into at most two balanced lines (`balance_lines`); skips if `.srt` already exists
 
 ### Key Constants
 
-- `DEFAULT_MAX_SEGMENT_LENGTH`: 195 seconds (3m15s) — just under the ~200s per-inference limit baked into the ONNX export's positional-embedding table
+- `FALLBACK_MAX_SEGMENT_LENGTH`: 195 seconds (3m15s) — the segment length used only when the model reports no practical per-call audio limit (the real default comes from `Session::limits()` at startup)
 - `ESTIMATED_REALTIME_FACTOR`: 6 — measured CPU throughput, used only for `--dry-run` estimates
-- `MODEL_REPO` / `MODEL_FILES`: the pinned HuggingFace model repo and the exact int8 files downloaded from it
+- `MODEL_REPO` / `MODEL_FILE`: the pinned HuggingFace model repo and the exact Q8_0 GGUF file downloaded from it
 - `MAX_LINE_CHARS` / `MAX_CUE_SECS`: the subtitle envelope (two 42-char lines, ≤7s per cue); the cue-shaping constants block in `main.rs` documents the full cost model (boundary costs, short-cue penalties, pause inference)
 
 ### CLI Flags
@@ -68,5 +69,7 @@ Single-file async Rust application (`src/main.rs`) that:
 ## External Dependencies
 
 Requires `ffmpeg` and `ffprobe` in PATH for audio extraction and delay
-detection. ONNX Runtime is linked in at build time by the `ort` crate
-(its build script downloads prebuilt binaries).
+detection. The transcribe.cpp C++ core is compiled and statically linked at
+build time by the `transcribe-cpp-sys` crate, which needs `cmake` and a C++
+toolchain; the Linux Vulkan backend additionally needs the Vulkan headers,
+SPIRV headers, and `glslc` at build time.

@@ -2,25 +2,25 @@
 
 Generate SRT subtitle files from video using local speech-to-text.
 
-Transcription runs fully locally using NVIDIA's [Parakeet] model via [ONNX
-Runtime]; it is free, private (no audio ever leaves your machine), and fast.
-When built from source, inference automatically uses your GPU — AMD and
-NVIDIA alike, via ONNX Runtime's WebGPU backend (measured ~9x realtime on a
-Radeon 7900 XT) — and falls back to CPU otherwise (~6x realtime measured on
-a 32-core desktop CPU). On first run, the model files (~670 MB) are
+Transcription runs fully locally using NVIDIA's [Parakeet] model via
+[transcribe.cpp] (ggml); it is free, private (no audio ever leaves your
+machine), and fast (measured ~160x realtime on a Radeon 7900 XT, ~19x on a
+32-core desktop CPU). Inference automatically uses your GPU — Vulkan on
+Linux (AMD and NVIDIA alike), Metal on macOS — and falls back to CPU when
+no usable GPU is present. On first run, the model (~740 MB, a single GGUF file) is
 downloaded from [HuggingFace][model].
 
 [Parakeet]: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
-[ONNX Runtime]: https://onnxruntime.ai/
-[model]: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx
+[transcribe.cpp]: https://github.com/handy-computer/transcribe.cpp
+[model]: https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf
 
 ## Why this tool?
 
 Speech-to-text models can only transcribe so much audio in one go — the
-Parakeet ONNX export accepts at most ~200 seconds per inference call. This
-tool handles arbitrarily long videos by:
+model states its per-inference-call limit, and sirtea asks it at startup.
+This tool handles arbitrarily long videos by:
 
-1. Splitting audio into segments (3m15s by default)
+1. Splitting audio into segments the model can accept in one call
 2. Finding natural sentence boundaries for clean splits
 3. Stitching captions back together with correct timestamps
 
@@ -34,30 +34,39 @@ segmenting-and-stitching approach it describes is unchanged).
 
 Download from the [releases page](https://github.com/jonhoo/sirtea/releases).
 
-**Note: the pre-built binaries are CPU-only.** GPU inference requires a
-separate shared library (`libwebgpu_dawn.so`) that the release installers
-cannot deliver, so the pre-built binaries are built without GPU support to
-stay self-contained. For maximum performance, build from source.
-
 ### From source
 
 ```bash
 cargo install sirtea
 ```
 
-Source builds enable GPU inference (via ONNX Runtime's WebGPU backend) by
-default. On targets without WebGPU-enabled ONNX Runtime prebuilts (e.g.
-aarch64 Linux), the `webgpu` feature fails to link; build without it:
+Building from source compiles the transcribe.cpp C++ core, which needs
+`cmake` and a C++ toolchain. On Linux, the (always-on) Vulkan GPU backend
+additionally needs the Vulkan development packages at build time: the
+Vulkan headers, SPIRV headers, and the `glslc` shader compiler (on Arch:
+`vulkan-headers`, `spirv-headers`, `shaderc`; on Debian/Ubuntu the
+`vulkan-sdk` or `libvulkan-dev` + `spirv-headers` + `glslc` packages). On
+macOS the Metal backend needs only Xcode's toolchain. Machines without a
+usable GPU at *runtime* are fine either way: inference falls back to CPU
+automatically (the chosen backend is printed at startup).
+
+If linking fails with `undefined symbol: cblas_sgemm`, your system's BLAS
+exposes only the Fortran interface (e.g. Arch's netlib `blas` package
+without `cblas` on the link line); build without system BLAS instead —
+it only affects the lightweight host-side kernels:
 
 ```bash
-cargo install sirtea --no-default-features
+TRANSCRIBE_CMAKE_ARGS=-DTRANSCRIBE_USE_SYSTEM_BLAS=OFF cargo install sirtea
 ```
 
 ### Requirements
 
 - [ffmpeg and ffprobe](https://ffmpeg.org/download.html) in your PATH
-- ~700 MB of disk for the auto-downloaded model, and ~5 GB of RAM
-  during inference
+- ~740 MB of disk for the auto-downloaded model
+
+If you previously used the ONNX-based version of sirtea, the old model
+directory (`~/.local/share/sirtea/models/parakeet-tdt-0.6b-v3-int8` on
+Linux) is no longer used and can be deleted to reclaim ~670 MB.
 
 ## Usage
 
@@ -98,8 +107,8 @@ These can be set in the config file or overridden via CLI flags:
 
 | Option | CLI flag | Default | Description |
 |--------|----------|---------|-------------|
-| `model_path` | `--model` | auto-download | Directory holding the [Parakeet model files][model]; when unset, they are downloaded on first run into the per-user data dir (e.g. `~/.local/share/sirtea/models/` on Linux) |
-| `segment_length` | `--segment-length` | 195 | Max segment length in seconds. The bundled model accepts at most ~200 seconds per inference call, so the default sits just under that ceiling; lowering it mainly reduces memory use |
+| `model_path` | `--model` | auto-download | Path to the [Parakeet GGUF model file][model] (any quantization; a directory containing the default file also works); when unset, it is downloaded on first run into the per-user data dir (e.g. `~/.local/share/sirtea/models/` on Linux) |
+| `segment_length` | `--segment-length` | model limit | Max segment length in seconds. Defaults to the model's own per-inference-call audio limit, queried at startup; values above it are rejected, and lowering it mainly reduces memory use |
 
 > **Upgrading from the Gladia-based version?** Transcription is now local, so
 > the `gladia_api_key`, `max_cost`, and `parallel` settings are gone; remove
@@ -125,7 +134,8 @@ The code is licensed under either of
 at your option.
 
 The Parakeet model weights downloaded on first run are NVIDIA's, licensed
-[CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/).
+[CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) (repackaged in
+GGUF form by the [transcribe.cpp] authors).
 
 ## Contribution
 
