@@ -2,7 +2,7 @@
 name = "sirtea"
 version = "0.1.0"
 edition = "2021"
-description = "Generate SRT subtitle files from video using the Gladia speech-to-text API"
+description = "Generate SRT subtitle files from video using local NVIDIA Parakeet speech-to-text"
 repository = "https://github.com/jonhoo/sirtea"
 license = "MIT OR Apache-2.0"
 keywords = ["caption", "subtitle", "srt", "transcription", "speech-to-text"]
@@ -13,14 +13,33 @@ anyhow = "1.0.75"
 directories = "6.0.0"
 indicatif = "0.18.3"
 lexopt = "0.3.1"
-reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
+# reqwest is only used to download the Parakeet model files on first run;
+# transcription itself is fully local.
+reqwest = "0.13"
 serde = { version = "1.0.193", features = ["derive"] }
-serde_json = "1.0.108"
 symphonia = { version = "0.5.3", default-features = false, features = ["mkv", "isomp4", "aac", "mp3", "flac", "ogg", "vorbis"] }
 tokio = { version = "1.34.0", features = ["full"] }
-tokio-util = { version = "0.7.10", features = ["codec"] }
 toml = "0.9"
+# Bindings to transcribe.cpp (ggml/GGUF speech-to-text). default-features =
+# false drops the crate's default `metal` feature; the per-OS tables below
+# add the right GPU backend back for each platform. transcribe-cpp-sys
+# compiles the C++ core with cmake at build time, so cmake and a C++
+# toolchain are build requirements.
+transcribe-cpp = { version = "0.1.1", default-features = false }
 walkdir = "2.5.0"
+
+# ggml GPU backends are compile-time choices, and the natural one differs per
+# OS: Vulkan on Linux (statically linked into the binary — no shared-library
+# shipping problem — but needs the Vulkan SDK + glslc at build time), Metal
+# on macOS. Machines without a usable GPU fall back to CPU at runtime, so
+# there is no CPU-only build variant.
+# TODO: Windows GPU (Vulkan should work there too; untested) — CPU-only for
+# now.
+[target.'cfg(target_os = "linux")'.dependencies]
+transcribe-cpp = { version = "0.1.1", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+transcribe-cpp = { version = "0.1.1", default-features = false, features = ["metal"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

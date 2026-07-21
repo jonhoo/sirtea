@@ -4,21 +4,16 @@
 #   Linux:   ~/.config/sirtea/config.toml
 #   macOS:   ~/Library/Application Support/sirtea/config.toml
 #   Windows: C:\Users\<user>\AppData\Roaming\sirtea\config.toml
-#
-# Or set the GLADIA_API_KEY environment variable instead.
 
-# Required: Your Gladia API key
-# Get one at https://app.gladia.io/ -> Account -> Generate Key
-gladia_api_key = ""
-
-# Optional: Maximum cost before stopping transcription (in dollars)
-# Default: 10.0
-# max_cost = 10.0
-
-# Optional: Number of concurrent transcriptions
-# Default: 3
-# parallel = 3
+# Optional: Path to the Parakeet GGUF model file (any quantization from
+# https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf works; a
+# directory containing parakeet-tdt-0.6b-v3-Q8_0.gguf is also accepted).
+# Default: unset, meaning the model is downloaded automatically on first run
+# into the per-user data dir (e.g. ~/.local/share/sirtea/models/ on Linux).
+# model_path = "/path/to/parakeet-tdt-0.6b-v3-Q8_0.gguf"
 
 # Optional: Maximum segment length in seconds before splitting
-# Default: 5400 (1h30m)
-# segment_length = 5400
+# Default: the model's own per-inference-call audio limit, queried at
+# startup. Values above that limit are rejected; lowering it mainly reduces
+# memory use.
+# segment_length = 195
