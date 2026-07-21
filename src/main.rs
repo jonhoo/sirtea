@@ -85,12 +85,13 @@ const BOUNDARY_NONE: f64 = 30.0;
 const FUNCTION_WORD_BREAK_PENALTY: f64 = 10.0;
 
 /// A deliberately generous (slow) estimate of how long a word takes to say:
-/// ~11 chars/s plus fixed per-word overhead. Parakeet's word timestamps are
-/// contiguous — each word ends exactly where the next begins — so silence is
-/// absorbed into the preceding word's raw duration. A word whose raw duration
-/// exceeds this estimate by `PAUSE_MIN_SECS` therefore marks a real pause.
-/// Over-estimating errs toward keeping cues on screen slightly too long
-/// rather than cutting them off mid-word.
+/// ~11 chars/s plus fixed per-word overhead. Silence around a word shows up
+/// either absorbed into its raw end (mostly-contiguous timestamps) or as a
+/// gap before the next word, so the span from a word's start to the next
+/// word's start exceeding this estimate by `PAUSE_MIN_SECS` marks a real
+/// pause (see the cue-building section comment). Over-estimating errs
+/// toward keeping cues on screen slightly too long rather than cutting
+/// them off mid-word.
 const WORD_SPEECH_FLOOR: f64 = 0.25;
 const WORD_SPEECH_PER_CHAR: f64 = 0.09;
 const PAUSE_MIN_SECS: f64 = 0.8;
@@ -451,13 +452,16 @@ struct Utterance {
 // re-group words into cues ourselves, aiming for the standard subtitle
 // envelope (two lines of `MAX_LINE_CHARS`, at most `MAX_CUE_SECS` each).
 //
-// One property of Parakeet's output does a lot of work here: token
-// timestamps are contiguous — each word ends exactly where the next one
-// begins — so silence is absorbed into the *end* of the preceding word. That
-// means (a) there are no inter-word gaps to split at, but (b) a word whose
-// raw duration far exceeds the time needed to actually say it marks a real
-// pause. We use (b) both to prefer split points at pauses and to trim cue
-// end times so captions don't linger on screen through silence.
+// How silence shows up in the word timestamps does a lot of work here.
+// Parakeet's ONNX export emitted strictly contiguous timestamps (each word
+// ended exactly where the next began, silence absorbed into the preceding
+// word's raw end); transcribe.cpp's output is *mostly* like that but also
+// produces genuine inter-word gaps (measured: mostly 80–480ms, typically
+// after sentence-final words). Both representations reduce to one signal:
+// the span from a word's start to the *next word's start*, minus the time
+// needed to actually say the word, is silence. We use that both to prefer
+// split points at pauses and to trim/extend cue display times so captions
+// neither linger through silence nor vanish the instant the voice stops.
 
 /// Estimated time to speak `text`; a deliberate over-estimate (see the
 /// comment on `WORD_SPEECH_PER_CHAR`).
@@ -508,10 +512,12 @@ fn is_function_word(word: &str) -> bool {
     )
 }
 
-/// The cost of ending a cue after `word`, mid-sentence. Sentence-final
-/// boundaries never reach this function: `build_cues` splits at sentence
-/// ends before the per-sentence segmentation runs.
-fn boundary_cost(word: &Utterance) -> f64 {
+/// The cost of ending a cue after `word`, mid-sentence, where `next_start`
+/// is the start time of the word that follows it. Sentence-final boundaries
+/// never reach this function: `build_cues` splits at sentence ends before
+/// the per-sentence segmentation runs (which is also why a following word
+/// always exists here).
+fn boundary_cost(word: &Utterance, next_start: f64) -> f64 {
     // Check `...` before `,`/`:`/`;`: it must not fall through to the
     // single-character cases, and certainly not to BOUNDARY_NONE.
     let punctuation = if word.text.ends_with("...") || word.text.ends_with(',') {
@@ -523,9 +529,11 @@ fn boundary_cost(word: &Utterance) -> f64 {
     } else {
         BOUNDARY_NONE
     };
-    // Contiguous timestamps absorb silence into the preceding word, so an
-    // inflated raw duration reveals a pause (see WORD_SPEECH_PER_CHAR).
-    let trailing_silence = (word.end - word.start) - est_spoken_secs(&word.text);
+    // Silence before the next word reveals a pause, whether the engine
+    // absorbed it into this word's raw end (inflated duration) or left it
+    // as an inter-word gap (see the section comment above and
+    // WORD_SPEECH_PER_CHAR).
+    let trailing_silence = (next_start - word.start) - est_spoken_secs(&word.text);
     if trailing_silence >= PAUSE_MIN_SECS {
         punctuation.min(BOUNDARY_PAUSE)
     } else {
@@ -546,7 +554,10 @@ fn build_cues(words: &[Utterance]) -> Vec<Utterance> {
         // The last word always terminates the final sentence, punctuated or
         // not: hard cuts at segment ends can leave unpunctuated tails.
         if next.is_none() || ends_sentence(&words[i].text, next) {
-            split_sentence_into_cues(&words[sentence_start..=i], &mut cues);
+            // The next word's start (if any) caps how far the sentence's
+            // final cue may linger on screen.
+            let next_start = words.get(i + 1).map(|w| w.start);
+            split_sentence_into_cues(&words[sentence_start..=i], next_start, &mut cues);
             sentence_start = i + 1;
         }
     }
@@ -562,11 +573,28 @@ fn build_cues(words: &[Utterance]) -> Vec<Utterance> {
 /// the global optimum avoids shaving off awkward single-word tail cues, and
 /// all tuning lives in the cost constants at the top of the file. Cost is
 /// negligible: the inner loop is bounded by how many words fit in a cue.
-fn split_sentence_into_cues(sentence: &[Utterance], cues: &mut Vec<Utterance>) {
+fn split_sentence_into_cues(
+    sentence: &[Utterance],
+    next_start: Option<f64>,
+    cues: &mut Vec<Utterance>,
+) {
     let n = sentence.len();
     if n == 0 {
         return;
     }
+
+    // How far the cue ending at sentence[i - 1] may be displayed: to the
+    // start of the word that follows it — within the sentence, or
+    // `next_start` past it. Under strictly contiguous timestamps this
+    // equals the word's own raw end, reproducing the old "never past the
+    // raw end" cap; with gapped timestamps it lets a cue linger into the
+    // gap without ever overlapping the next cue. The final word of the
+    // last sentence has nothing after it; its own raw end is the
+    // conservative cap.
+    let display_cap = |i: usize| match sentence.get(i) {
+        Some(next_word) => next_word.start,
+        None => next_start.unwrap_or(sentence[n - 1].end),
+    };
 
     // Prefix sums of word lengths so any candidate cue's character count
     // (words plus joining spaces) is O(1).
@@ -600,21 +628,21 @@ fn split_sentence_into_cues(sentence: &[Utterance], cues: &mut Vec<Utterance>) {
         let break_cost = if i == n {
             0.0
         } else {
-            boundary_cost(&sentence[i - 1])
+            boundary_cost(&sentence[i - 1], sentence[i].start)
         };
-        // Measure candidate cues as they will be displayed: the final
-        // word's trailing absorbed silence gets trimmed at emission below,
-        // so it must not count against the duration limit — otherwise a
-        // long pause after a short sentence fragment makes every multi-word
+        // Measure candidate cues as they will be displayed: the silence
+        // trailing the final word gets trimmed at emission below, so it
+        // must not count against the duration limit — otherwise a long
+        // pause after a short sentence fragment makes every multi-word
         // candidate infeasible and forces a lone-word crumb cue before the
-        // pause. Pauses *inside* a candidate still count in full, since an
-        // earlier word's inflated end delays every word after it — so a
-        // long internal pause still blows the limit and forces a split at
-        // the pause, exactly where one belongs.
+        // pause. Pauses *inside* a candidate still count in full, whether
+        // absorbed into a word's raw end or left as a gap, since either
+        // way they delay every word after them — so a long internal pause
+        // still blows the limit and forces a split at the pause, exactly
+        // where one belongs.
         let last = &sentence[i - 1];
-        let display_end = last
-            .end
-            .min(last.start + est_spoken_secs(&last.text) + CUE_LINGER_SECS);
+        let display_end =
+            (last.start + est_spoken_secs(&last.text) + CUE_LINGER_SECS).min(display_cap(i));
         for j in (0..i).rev() {
             let duration = display_end - sentence[j].start;
             if !fits_two_lines(j, i) || duration > MAX_CUE_SECS {
@@ -652,18 +680,16 @@ fn split_sentence_into_cues(sentence: &[Utterance], cues: &mut Vec<Utterance>) {
             .join(" ");
         let start = words[0].start;
         let last = words.last().expect("cue spans at least one word");
-        // Trim the display time so a cue doesn't linger through the silence
-        // absorbed into its final word's raw end, but never below the
-        // readability floor and never past the raw end (which would overlap
-        // the next cue).
+        // Trim the display time so a cue doesn't linger through the
+        // silence trailing its final word, but never below the readability
+        // floor and never past the next word's start (which would overlap
+        // the next cue; see `display_cap`).
         // TODO: measuring RMS energy on the raw samples would trim (and
         // place pause boundaries) exactly instead of by estimate; that
         // belongs together with the split-preference TODO in `main`.
-        let end = last
-            .end
-            .min(last.start + est_spoken_secs(&last.text) + CUE_LINGER_SECS)
+        let end = (last.start + est_spoken_secs(&last.text) + CUE_LINGER_SECS)
             .max(start + MIN_CUE_SECS)
-            .min(last.end);
+            .min(display_cap(pair[1]));
         cues.push(Utterance { start, end, text });
     }
 }
@@ -1341,17 +1367,18 @@ async fn main() -> anyhow::Result<()> {
                     // following it, and resume transcription from that point rather than from
                     // the hard cut.
                     //
-                    // Note that we cannot look for silence gaps between captions here (as this
-                    // code did in its cloud-API days): Parakeet's token timestamps are contiguous
-                    // by construction, so consecutive *words* never have a gap between them
-                    // (build_cues instead infers pauses from inflated word durations).
+                    // Note that we don't look for silence gaps between captions here (as this
+                    // code did in its cloud-API days): transcribe.cpp's word timestamps are
+                    // mostly contiguous, with silence largely absorbed into the preceding
+                    // word (build_cues infers pauses from the span to the next word's start
+                    // instead), so gap-based split-point selection would rarely find one.
                     // TODO: we hold the raw samples right here; measuring RMS energy around
                     // candidate boundaries would let us prefer genuinely quiet ones again.
                     let split_idx = pick_split_index(&utterances);
-                    // Resume from the *raw* end of the chosen cue's last word, which by
-                    // timestamp contiguity is the next cue's start. The chosen cue's own
-                    // `end` is display-trimmed (trailing silence removed), so resuming
-                    // there would re-transcribe audio we already emitted captions for.
+                    // Resume from the next cue's start: everything before it was either
+                    // emitted as captions or is silence. The chosen cue's own `end` is
+                    // display-trimmed (trailing silence removed), so resuming there would
+                    // re-transcribe audio we already emitted captions for.
                     // With a single cue there is no next cue; that's the hard-cut
                     // fallback, where the trimmed end only re-covers inferred silence.
                     let slice_at_secs = utterances
@@ -1878,6 +1905,44 @@ mod tests {
             w(10.0, 15.0, "hard-cut tail caption."),
         ];
         assert_eq!(pick_split_index(&utterances), 1);
+    }
+
+    #[test]
+    fn cues_gapped_timestamps_pause_and_linger() {
+        // transcribe.cpp sometimes leaves real inter-word gaps instead of
+        // absorbing silence into the preceding word (see the cue-building
+        // section comment). Model a run-on sentence with a 4s *gap* (tight
+        // word ends) after "instead,": the pause must still be detected as
+        // a split point, and the first cue must linger a little into the
+        // gap without reaching the next cue's start.
+        let text =
+            "So we run the program again with the flag instead, and then we see the output change";
+        let mut words = words_at_pace(text, 0.0, 0.3);
+        for word in &mut words {
+            // Tighten every word to its estimated spoken duration so that
+            // silence exists only as the inter-word gap below.
+            word.end = word.start + 0.25;
+        }
+        for word in &mut words[10..] {
+            word.start += 4.0;
+            word.end += 4.0;
+        }
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert!(
+            cues[0].text.ends_with("instead,"),
+            "should split at the gap pause: {cues:?}"
+        );
+        // The first cue lingers past its final word's tight raw end, but
+        // never up to the next word's start.
+        let last_word = &words[9];
+        assert!(
+            cues[0].end > last_word.end,
+            "cue should linger into the gap: end {} vs raw end {}",
+            cues[0].end,
+            last_word.end
+        );
+        assert!(cues[0].end < words[10].start);
     }
 
     #[test]
