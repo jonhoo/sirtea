@@ -64,10 +64,6 @@ TRANSCRIBE_CMAKE_ARGS=-DTRANSCRIBE_USE_SYSTEM_BLAS=OFF cargo install sirtea
 - [ffmpeg and ffprobe](https://ffmpeg.org/download.html) in your PATH
 - ~740 MB of disk for the auto-downloaded model
 
-If you previously used the ONNX-based version of sirtea, the old model
-directory (`~/.local/share/sirtea/models/parakeet-tdt-0.6b-v3-int8` on
-Linux) is no longer used and can be deleted to reclaim ~670 MB.
-
 ## Usage
 
 ```bash
@@ -77,8 +73,7 @@ sirtea --dry-run *.mkv             # List what would be transcribed
 sirtea -q video.mp4                # Quiet mode (errors only)
 ```
 
-Output SRT files are created alongside the input videos (e.g., `video.mkv` →
-`video.srt`). Videos with existing `.srt` files are skipped.
+Output SRT files are created alongside the input videos (e.g., `video.mkv` → `video.srt`). Videos with existing `.srt` files are skipped.
 
 ## Caveats
 
