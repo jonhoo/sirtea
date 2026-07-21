@@ -100,6 +100,43 @@ const PAUSE_MIN_SECS: f64 = 0.8;
 /// so trimmed cues don't vanish the instant the voice stops.
 const CUE_LINGER_SECS: f64 = 0.5;
 
+/// The sample rate we have ffmpeg resample to; Parakeet consumes 16kHz mono
+/// f32 samples. Also the basis for every samples-to-seconds conversion in
+/// the segmentation loop.
+const SAMPLE_RATE: usize = 16_000;
+
+/// Long-silence re-anchoring.
+///
+/// Parakeet's word timestamps have been observed to nondeterministically
+/// "collapse" a long mid-segment silence: the first post-silence word gets
+/// stamped right after the pre-silence word, and every timestamp after it in
+/// the segment runs early — observed as a near-constant ~4-5s regardless of
+/// the silence's true length (Vulkan backend; a bit-identical rerun of the
+/// same file didn't reproduce it). Since both caption placement and the next
+/// segment's start are derived from those timestamps, one collapse used to
+/// shift *all* captions until a later hard re-anchor snapped them back.
+///
+/// To make that structurally impossible, we never let a long silence sit
+/// inside an inference window: the window is truncated at the silence and
+/// transcription resumes just inside its far end, with both cut points
+/// computed from sample counts (exact) rather than model output.
+///
+/// A window counts as silent below -45 dBFS RMS: measured on a real
+/// recording, genuine pauses sit at -47..-54 dBFS, while even a very quiet
+/// aside (one that a cloud transcription service failed to hear at all)
+/// peaked above -40 dBFS every second or so — so requiring
+/// `MIN_SPLIT_SILENCE_SECS` of *consecutive* sub-threshold windows keeps
+/// quiet speech safe. Silences with intermittent noise (keyboard taps) may
+/// go undetected; that's acceptable — this is a hardening bound, not a
+/// correctness requirement.
+const SILENCE_RMS_DBFS: f64 = -45.0;
+const SILENCE_WINDOW_SECS: f64 = 0.1;
+const MIN_SPLIT_SILENCE_SECS: f64 = 3.0;
+/// How much of a detected silence to keep on either side of the cut, so
+/// neither the last pre-silence word nor the first post-silence word is
+/// clipped mid-phoneme.
+const SILENCE_EDGE_MARGIN_SECS: f64 = 0.25;
+
 /// The HuggingFace repository holding the GGUF conversion of Parakeet that we
 /// use (converted and tested by the transcribe.cpp authors).
 const MODEL_REPO: &str = "handy-computer/parakeet-tdt-0.6b-v3-gguf";
@@ -803,11 +840,50 @@ fn pcm_f32le_to_samples(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
         bytes.len()
     );
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            f32::from_le_bytes(chunk.try_into().expect("chunks_exact yields 4-byte chunks"))
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
+}
+
+/// Find the first run of at least `MIN_SPLIT_SILENCE_SECS` of audio below
+/// `SILENCE_RMS_DBFS`, as a `(start, end)` sample range (window-granular).
+/// A run that touches the end of the buffer may well continue beyond it;
+/// the caller can't tell, and handles that case by resuming near `end` and
+/// letting the next extraction rediscover the remainder.
+fn find_long_silence(samples: &[f32]) -> Option<(usize, usize)> {
+    let window = (SILENCE_WINDOW_SECS * SAMPLE_RATE as f64) as usize;
+    let min_windows = (MIN_SPLIT_SILENCE_SECS / SILENCE_WINDOW_SECS).round() as usize;
+    // The equivalent mean-power threshold, so the scan needs no log10.
+    let threshold = 10f64.powf(SILENCE_RMS_DBFS / 10.0);
+    // (first window index, windows in run) of the current sub-threshold run
+    let mut run: Option<(usize, usize)> = None;
+    let as_range = |(first, len): (usize, usize)| {
+        (first * window, ((first + len) * window).min(samples.len()))
+    };
+    for (i, chunk) in samples.chunks(window).enumerate() {
+        // Mean power over the window; the final chunk may be partial, which
+        // is fine to judge on its own.
+        let power = chunk
+            .iter()
+            .map(|&s| f64::from(s) * f64::from(s))
+            .sum::<f64>()
+            / chunk.len() as f64;
+        if power < threshold {
+            match &mut run {
+                Some((_, len)) => *len += 1,
+                None => run = Some((i, 1)),
+            }
+        } else {
+            if let Some(r) = run.take() {
+                if r.1 >= min_windows {
+                    return Some(as_range(r));
+                }
+            }
+        }
+    }
+    run.filter(|&(_, len)| len >= min_windows).map(as_range)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1244,7 +1320,7 @@ async fn main() -> anyhow::Result<()> {
                     .arg("-ac")
                     .arg("1")
                     .arg("-ar")
-                    .arg("16000")
+                    .arg(SAMPLE_RATE.to_string())
                     .arg("-c:a")
                     .arg("pcm_f32le")
                     .arg("-f")
@@ -1285,8 +1361,93 @@ async fn main() -> anyhow::Result<()> {
                     let ffmpeg_err = String::from_utf8_lossy(&ffmpeg.stderr);
                     return Err(anyhow::anyhow!("{ffmpeg_err}")).context("extract audio segment");
                 }
-                let samples =
+                let mut samples =
                     pcm_f32le_to_samples(&ffmpeg.stdout).context("interpret extracted PCM")?;
+                let extracted_secs = samples.len() as f64 / SAMPLE_RATE as f64;
+
+                // Every downstream timestamp in this segment assumes the PCM
+                // starts at `start` and is as long as requested, so a
+                // mismatch here (a lying container index, a truncated
+                // stream) corrupts them all — make it visible rather than
+                // silently producing shifted captions. `-t` caps the output,
+                // so it is the expected length even when adelay pads the
+                // front. The last segment has no `-t`; its length is only
+                // known from container metadata, which is too imprecise to
+                // check against.
+                if let Some(limit) = duration_limit {
+                    if (extracted_secs - limit).abs() > 0.25 {
+                        eprintln!(
+                            "warning: {}: ffmpeg produced {:.2}s of audio where {:.2}s was \
+                             requested at {}; captions may be misplaced",
+                            video_name,
+                            extracted_secs,
+                            limit,
+                            format_srt_timestamp(start_f64),
+                        );
+                    }
+                }
+
+                // ---- Long-silence re-anchoring (see SILENCE_RMS_DBFS) ----
+                //
+                // If the extracted window contains a long silence, don't let
+                // it reach the model: transcribe only up to the silence, and
+                // resume just inside its far end. Both cut points are
+                // sample-count-derived, so — like the fully-silent branch
+                // below — they re-anchor the timeline exactly, independent
+                // of model-reported timestamps.
+                //
+                // `resume_at_secs` is how far into *this* window the next
+                // segment starts; `Some` also means the cue set is final
+                // (the audio ended in real silence, not a hard cut), so the
+                // sentence-boundary split search is skipped.
+                //
+                // TODO: each re-anchor discards the rest of the extracted
+                // window and has ffmpeg re-decode it next iteration (~280
+                // extra extractions on a pause-heavy 5h recording). The
+                // remainder is already in `samples`; reusing it (topped up
+                // to a full window) would avoid that at the cost of more
+                // bookkeeping.
+                let mut resume_at_secs: Option<f64> = None;
+                if let Some((sil_start, sil_end)) = find_long_silence(&samples) {
+                    let margin = (SILENCE_EDGE_MARGIN_SECS * SAMPLE_RATE as f64) as usize;
+                    // Resume just before the silence ends so the first
+                    // post-silence word keeps its onset. A silence run is
+                    // several times longer than two margins, so this always
+                    // makes forward progress.
+                    let resume = sil_end.saturating_sub(margin).max(sil_start + margin);
+                    let resume_secs = resume.min(samples.len()) as f64 / SAMPLE_RATE as f64;
+                    if sil_start == 0 {
+                        // The window *starts* silent: there is nothing to
+                        // transcribe before the silence, so skip forward
+                        // without an inference call. (A window that is
+                        // silent throughout resumes at its far edge, and the
+                        // next iteration continues the skipping.)
+                        if verbose {
+                            eprintln!(
+                                "{}: leading silence at {}, skipping to {}",
+                                video_name,
+                                format_srt_timestamp(start_f64),
+                                format_srt_timestamp(start_f64 + resume_secs),
+                            );
+                        }
+                        start += Duration::from_secs_f64(resume_secs);
+                        prev_split_info = Some(PrevSegment::Silence);
+                        segment_index += 1;
+                        continue;
+                    }
+                    if verbose {
+                        eprintln!(
+                            "{}: re-anchoring at silence [{} .. {}]",
+                            video_name,
+                            format_srt_timestamp(start_f64 + sil_start as f64 / SAMPLE_RATE as f64),
+                            format_srt_timestamp(start_f64 + sil_end as f64 / SAMPLE_RATE as f64),
+                        );
+                    }
+                    // Keep a hair of the silence after the last word so it
+                    // isn't clipped mid-phoneme.
+                    samples.truncate(sil_start + margin);
+                    resume_at_secs = Some(resume_secs);
+                }
 
                 if let Some(ref pb) = progress_bar {
                     let msg = if segment_index == 0 && is_last {
@@ -1336,12 +1497,18 @@ async fn main() -> anyhow::Result<()> {
                 // all is still reported as an error after the loop, since that more likely
                 // indicates broken audio than a genuinely silent recording.
                 if utterances.is_empty() {
-                    if is_last {
-                        break;
-                    }
                     // With no transcript there is no sentence boundary to split at either,
-                    // so resume from the hard cut at the end of the extracted window.
-                    let consumed = duration_limit.expect("non-last segments always have a limit");
+                    // so resume from the hard cut at the end of the extracted window — or,
+                    // if the window was truncated at a detected silence, from that exact
+                    // resume point (this branch is then reachable even on the last
+                    // segment, which still has audio left after the silence).
+                    let consumed = if let Some(resume) = resume_at_secs {
+                        resume
+                    } else if is_last {
+                        break;
+                    } else {
+                        duration_limit.expect("non-last segments always have a limit")
+                    };
                     if verbose {
                         eprintln!(
                             "{}: silent segment at {}, skipping to {}",
@@ -1356,8 +1523,17 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // A window truncated at a long silence needs no split search: the cue
+                // set is complete (the audio ended in genuine silence, not a hard cut
+                // mid-sentence), and the resume point is already fixed by sample
+                // arithmetic above. This deliberately overrides `is_last` too — the
+                // audio after the silence still needs transcribing.
+                if let Some(resume) = resume_at_secs {
+                    start += Duration::from_secs_f64(resume);
+                    prev_split_info = Some(PrevSegment::Silence);
+                }
                 // if we're not at the last segment, we need to find a good place to split
-                if !is_last {
+                else if !is_last {
                     if let Some(ref pb) = progress_bar {
                         pb.set_message("finding split point");
                     }
@@ -1413,7 +1589,7 @@ async fn main() -> anyhow::Result<()> {
                 }));
 
                 segment_index += 1;
-                if is_last {
+                if is_last && resume_at_secs.is_none() {
                     break;
                 }
             }
@@ -1507,6 +1683,86 @@ mod tests {
     #[test]
     fn zero_fract() {
         assert_eq!(format_srt_timestamp(3661.0), "01:01:01,000");
+    }
+
+    /// `find_long_silence` fixtures: "loud" is sine-ish full-scale noise,
+    /// "quiet" is well under the -45 dBFS threshold. Durations in seconds.
+    fn audio(spec: &[(f64, bool)]) -> Vec<f32> {
+        spec.iter()
+            .flat_map(|&(secs, loud)| {
+                let n = (secs * SAMPLE_RATE as f64) as usize;
+                // A constant DC value has the same RMS math as a real
+                // signal for our purposes; 0.5 is -6 dBFS, 1e-4 is -80 dBFS.
+                std::iter::repeat_n(if loud { 0.5 } else { 1e-4 }, n)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn silence_none_in_speech() {
+        assert_eq!(find_long_silence(&audio(&[(10.0, true)])), None);
+    }
+
+    #[test]
+    fn silence_short_pause_ignored() {
+        // A 2s pause is below MIN_SPLIT_SILENCE_SECS.
+        assert_eq!(
+            find_long_silence(&audio(&[(4.0, true), (2.0, false), (4.0, true)])),
+            None
+        );
+    }
+
+    #[test]
+    fn silence_mid_detected() {
+        let (start, end) =
+            find_long_silence(&audio(&[(4.0, true), (5.0, false), (4.0, true)])).unwrap();
+        // Window-granular: allow one 100ms window of slack on each edge.
+        let window = SAMPLE_RATE / 10;
+        assert!(start.abs_diff(4 * SAMPLE_RATE) <= window, "start={start}");
+        assert!(end.abs_diff(9 * SAMPLE_RATE) <= window, "end={end}");
+    }
+
+    #[test]
+    fn silence_leading_detected() {
+        let (start, end) = find_long_silence(&audio(&[(5.0, false), (4.0, true)])).unwrap();
+        assert_eq!(start, 0);
+        assert!(
+            end.abs_diff(5 * SAMPLE_RATE) <= SAMPLE_RATE / 10,
+            "end={end}"
+        );
+    }
+
+    #[test]
+    fn silence_trailing_run_reported() {
+        // A run that touches the end of the buffer still counts, and is
+        // clamped to the buffer length.
+        let samples = audio(&[(4.0, true), (3.5, false)]);
+        let (start, end) = find_long_silence(&samples).unwrap();
+        assert!(
+            start.abs_diff(4 * SAMPLE_RATE) <= SAMPLE_RATE / 10,
+            "start={start}"
+        );
+        assert_eq!(end, samples.len());
+    }
+
+    #[test]
+    fn silence_first_of_several_wins() {
+        let (start, _) = find_long_silence(&audio(&[
+            (2.0, true),
+            (4.0, false),
+            (2.0, true),
+            (10.0, false),
+        ]))
+        .unwrap();
+        assert!(
+            start.abs_diff(2 * SAMPLE_RATE) <= SAMPLE_RATE / 10,
+            "start={start}"
+        );
+    }
+
+    #[test]
+    fn silence_empty_input() {
+        assert_eq!(find_long_silence(&[]), None);
     }
 
     #[test]
@@ -1765,6 +2021,44 @@ mod tests {
     }
 
     #[test]
+    fn cues_gapped_timestamps_pause_and_linger() {
+        // transcribe.cpp sometimes leaves real inter-word gaps instead of
+        // absorbing silence into the preceding word (see the cue-building
+        // section comment). Model a run-on sentence with a 4s *gap* (tight
+        // word ends) after "instead,": the pause must still be detected as
+        // a split point, and the first cue must linger a little into the
+        // gap without reaching the next cue's start.
+        let text =
+            "So we run the program again with the flag instead, and then we see the output change";
+        let mut words = words_at_pace(text, 0.0, 0.3);
+        for word in &mut words {
+            // Tighten every word to its estimated spoken duration so that
+            // silence exists only as the inter-word gap below.
+            word.end = word.start + 0.25;
+        }
+        for word in &mut words[10..] {
+            word.start += 4.0;
+            word.end += 4.0;
+        }
+        let cues = build_cues(&words);
+        assert_cue_invariants(&words, &cues);
+        assert!(
+            cues[0].text.ends_with("instead,"),
+            "should split at the gap pause: {cues:?}"
+        );
+        // The first cue lingers past its final word's tight raw end, but
+        // never up to the next word's start.
+        let last_word = &words[9];
+        assert!(
+            cues[0].end > last_word.end,
+            "cue should linger into the gap: end {} vs raw end {}",
+            cues[0].end,
+            last_word.end
+        );
+        assert!(cues[0].end < words[10].start);
+    }
+
+    #[test]
     fn cues_avoid_breaking_after_function_word() {
         // 18 unpunctuated words force one mid-clause split, and the
         // no-penalty tie region is seeded with "the": the break must slide
@@ -1905,44 +2199,6 @@ mod tests {
             w(10.0, 15.0, "hard-cut tail caption."),
         ];
         assert_eq!(pick_split_index(&utterances), 1);
-    }
-
-    #[test]
-    fn cues_gapped_timestamps_pause_and_linger() {
-        // transcribe.cpp sometimes leaves real inter-word gaps instead of
-        // absorbing silence into the preceding word (see the cue-building
-        // section comment). Model a run-on sentence with a 4s *gap* (tight
-        // word ends) after "instead,": the pause must still be detected as
-        // a split point, and the first cue must linger a little into the
-        // gap without reaching the next cue's start.
-        let text =
-            "So we run the program again with the flag instead, and then we see the output change";
-        let mut words = words_at_pace(text, 0.0, 0.3);
-        for word in &mut words {
-            // Tighten every word to its estimated spoken duration so that
-            // silence exists only as the inter-word gap below.
-            word.end = word.start + 0.25;
-        }
-        for word in &mut words[10..] {
-            word.start += 4.0;
-            word.end += 4.0;
-        }
-        let cues = build_cues(&words);
-        assert_cue_invariants(&words, &cues);
-        assert!(
-            cues[0].text.ends_with("instead,"),
-            "should split at the gap pause: {cues:?}"
-        );
-        // The first cue lingers past its final word's tight raw end, but
-        // never up to the next word's start.
-        let last_word = &words[9];
-        assert!(
-            cues[0].end > last_word.end,
-            "cue should linger into the gap: end {} vs raw end {}",
-            cues[0].end,
-            last_word.end
-        );
-        assert!(cues[0].end < words[10].start);
     }
 
     #[test]

@@ -46,7 +46,7 @@ Single-file async Rust application (`src/main.rs`) that:
 2. **Probes media** - Uses `symphonia` to read audio track metadata (duration, sample rate)
 3. **Ensures the model** - Downloads the Q8_0 Parakeet GGUF model on first run (atomic: downloads to a `.tmp` dir, renames into place)
 4. **Extracts audio** - Uses ffmpeg to decode to raw 16 kHz mono f32 PCM, buffered in memory per segment
-5. **Handles long videos** - Splits videos exceeding the segment length into chunks (default: the model's per-inference-call audio limit from `Session::limits()`), preferring sentence-final punctuation for clean splits (Parakeet's token timestamps are contiguous, so there are no silence gaps to detect)
+5. **Handles long videos** - Splits videos exceeding the segment length into chunks (default: the model's per-inference-call audio limit from `Session::limits()`), preferring sentence-final punctuation for clean splits (Parakeet's token timestamps are contiguous, so there are no silence gaps to detect in the *transcript*). Independently, long silences detected in the *PCM* (`find_long_silence`: ≥3s below −45 dBFS) truncate the inference window and become sample-exact re-anchor points — Parakeet has been observed to nondeterministically collapse a long silence out of its timeline, shifting everything after it several seconds early, and re-anchoring bounds that to a single segment
 6. **Transcribes locally** - Runs Parakeet inference via `transcribe-cpp` with `TimestampKind::Word`, one video at a time (transcribe.cpp allows only one in-flight run per loaded model anyway); the GPU backend is compiled in per-OS (Vulkan on Linux, Metal on macOS — see the target-specific dependency tables in `Cargo.toml`), falling back to CPU at runtime when no usable GPU is present
 7. **Builds cues** - `build_cues` re-groups word timestamps into subtitle-sized cues (at most two 42-char lines, ≤7s): sentences never merge, over-long sentences split via a Knuth-Plass-style DP preferring clause punctuation and inferred pauses (contiguous timestamps absorb silence into the preceding word, so inflated word durations reveal pauses), and cue display times are trimmed so captions don't linger through silence
 8. **Outputs SRT** - Writes captions with timestamps, wrapping cue text into at most two balanced lines (`balance_lines`); skips if `.srt` already exists
@@ -57,6 +57,7 @@ Single-file async Rust application (`src/main.rs`) that:
 - `ESTIMATED_REALTIME_FACTOR`: 6 — measured CPU throughput, used only for `--dry-run` estimates
 - `MODEL_REPO` / `MODEL_FILE`: the pinned HuggingFace model repo and the exact Q8_0 GGUF file downloaded from it
 - `MAX_LINE_CHARS` / `MAX_CUE_SECS`: the subtitle envelope (two 42-char lines, ≤7s per cue); the cue-shaping constants block in `main.rs` documents the full cost model (boundary costs, short-cue penalties, pause inference)
+- `SILENCE_RMS_DBFS` / `MIN_SPLIT_SILENCE_SECS`: the long-silence re-anchoring detector (its constants block in `main.rs` documents the measured thresholds and the Parakeet timestamp-collapse bug it guards against)
 
 ### CLI Flags
 
