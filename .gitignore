@@ -8,3 +8,4 @@
 *.m4a
 /tmp/
 SESSION.md
+.cargo/
