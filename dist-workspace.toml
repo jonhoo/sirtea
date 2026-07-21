@@ -34,3 +34,13 @@ cmake = '*'
 libvulkan-dev = '*'
 spirv-headers = '*'
 glslc = '*'
+
+# dist's default Linux build runners are ubuntu-22.04(-arm), but the `glslc`
+# package only entered Ubuntu in 23.04, so the apt dependencies above cannot
+# be satisfied there. Building on 24.04 instead raises the glibc floor of the
+# prebuilt binaries from 2.35 to 2.39 (excluding e.g. Debian bookworm and
+# Ubuntu 22.04 hosts) — accepted rather than sideloading glslc from an
+# external source into the release path.
+[dist.github-custom-runners]
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
