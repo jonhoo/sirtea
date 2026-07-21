@@ -16,7 +16,7 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Timestamp;
-use tokio::io::AsyncWriteExt;
+use std::io::Write;
 use transcribe_cpp::{disable_logging, init_backends_default, Model, RunOptions, TimestampKind};
 use walkdir::WalkDir;
 
@@ -315,13 +315,12 @@ fn load_config() -> anyhow::Result<Config> {
 }
 
 /// Check that a required external tool is available in PATH.
-async fn check_external_tool(name: &str) -> anyhow::Result<()> {
-    match tokio::process::Command::new(name)
+fn check_external_tool(name: &str) -> anyhow::Result<()> {
+    match std::process::Command::new(name)
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .await
     {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -341,7 +340,7 @@ async fn check_external_tool(name: &str) -> anyhow::Result<()> {
 /// Parakeet works); a directory is accepted for compatibility with the
 /// auto-download layout and must contain `MODEL_FILE`. Otherwise we use the
 /// per-user data dir and download the model on first use.
-async fn resolve_model_path(explicit: Option<PathBuf>, quiet: bool) -> anyhow::Result<PathBuf> {
+fn resolve_model_path(explicit: Option<PathBuf>, quiet: bool) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit {
         if path.is_file() {
             return Ok(path);
@@ -366,7 +365,7 @@ async fn resolve_model_path(explicit: Option<PathBuf>, quiet: bool) -> anyhow::R
         let config_path = config_dir()
             .map(|d| d.join("config.toml").display().to_string())
             .unwrap_or_else(|| "~/.config/sirtea/config.toml".to_string());
-        download_model(&dir, quiet).await.with_context(|| {
+        download_model(&dir, quiet).with_context(|| {
             format!(
                 "download the Parakeet model from https://huggingface.co/{MODEL_REPO}; \
                  if you are offline, download {MODEL_FILE} manually \
@@ -383,7 +382,7 @@ async fn resolve_model_path(explicit: Option<PathBuf>, quiet: bool) -> anyhow::R
 /// into place only once the download completed, so an interrupted download
 /// can never leave a directory that passes the `model_file_present` check
 /// with truncated weights in it.
-async fn download_model(target: &Path, quiet: bool) -> anyhow::Result<()> {
+fn download_model(target: &Path, quiet: bool) -> anyhow::Result<()> {
     // TODO: pin a sha256 digest for the model file instead of trusting
     // HuggingFace + TLS alone.
     let tmp_name = target
@@ -405,19 +404,29 @@ async fn download_model(target: &Path, quiet: bool) -> anyhow::Result<()> {
         );
     }
 
-    let client = reqwest::Client::new();
+    // Verify TLS against the platform trust store rather than ureq's default
+    // bundled webpki roots, so TLS-intercepting proxies with locally
+    // installed CA certificates keep working.
+    let agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build()
+        .new_agent();
     let url = format!("https://huggingface.co/{MODEL_REPO}/resolve/main/{MODEL_FILE}");
-    let mut resp = client
+    // ureq turns non-2xx statuses into Err by default, so there is no
+    // separate error_for_status step here.
+    let resp = agent
         .get(&url)
-        .send()
-        .await
-        .and_then(|resp| resp.error_for_status())
+        .call()
         .with_context(|| format!("fetch '{url}'"))?;
 
     let progress_bar = if quiet {
         None
     } else {
-        let pb = match resp.content_length() {
+        let pb = match resp.body().content_length() {
             Some(len) => ProgressBar::new(len).with_style(
                 ProgressStyle::with_template(
                     "{prefix} {bar:30} {bytes}/{total_bytes} ({bytes_per_sec})",
@@ -431,24 +440,17 @@ async fn download_model(target: &Path, quiet: bool) -> anyhow::Result<()> {
     };
 
     let out_path = tmp.join(MODEL_FILE);
-    let mut out = tokio::fs::File::create(&out_path)
-        .await
+    let mut out = std::fs::File::create(&out_path)
         .with_context(|| format!("create '{}'", out_path.display()))?;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("download '{url}'"))?
-    {
-        out.write_all(&chunk)
-            .await
-            .with_context(|| format!("write to '{}'", out_path.display()))?;
-        if let Some(ref pb) = progress_bar {
-            pb.inc(chunk.len() as u64);
-        }
+    // `into_reader()` is unlimited (ureq's 10 MB default body cap applies
+    // only to the `read_to_*` convenience methods) and errors out if the
+    // connection drops before all `Content-Length` bytes arrive.
+    let mut body = resp.into_body().into_reader();
+    match &progress_bar {
+        Some(pb) => std::io::copy(&mut pb.wrap_read(body), &mut out),
+        None => std::io::copy(&mut body, &mut out),
     }
-    out.flush()
-        .await
-        .with_context(|| format!("flush '{}'", out_path.display()))?;
+    .with_context(|| format!("download '{url}' to '{}'", out_path.display()))?;
     if let Some(pb) = progress_bar {
         pb.finish();
     }
@@ -912,8 +914,7 @@ fn ensure_segment_clears_delay(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = parse_args().context("parse arguments")?;
 
     if args.files.is_empty() {
@@ -921,8 +922,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Check for required external tools
-    check_external_tool("ffmpeg").await?;
-    check_external_tool("ffprobe").await?;
+    check_external_tool("ffmpeg")?;
+    check_external_tool("ffprobe")?;
 
     let config = load_config()?;
 
@@ -1030,7 +1031,7 @@ async fn main() -> anyhow::Result<()> {
         };
         let length = Duration::from_secs_f64(length.as_secs_f64());
         // TODO: for whatever reason, track.codec_params.start_ts is always 0, so use ffprobe
-        let delay = tokio::process::Command::new("ffprobe")
+        let delay = std::process::Command::new("ffprobe")
             .arg("-i")
             .arg(&path)
             .arg("-show_entries")
@@ -1041,7 +1042,6 @@ async fn main() -> anyhow::Result<()> {
             .arg("-of")
             .arg("default=noprint_wrappers=1:nokey=1")
             .output()
-            .await
             .with_context(|| format!("ffprobe '{}'", path.display()))?;
         let delay = std::str::from_utf8(&delay.stdout)
             .with_context(|| format!("non-utf8 in ffprobe '{}'", path.display()))?;
@@ -1117,7 +1117,7 @@ async fn main() -> anyhow::Result<()> {
     // Get the model ready before starting on any video so that configuration
     // problems (or a failed download) surface immediately rather than after
     // minutes of audio extraction.
-    let model_path = resolve_model_path(model_path_override, args.quiet).await?;
+    let model_path = resolve_model_path(model_path_override, args.quiet)?;
 
     // The native library logs diagnostics (per-run decoder stats, feature
     // warnings) straight to stderr by default, which would tear through the
@@ -1244,12 +1244,12 @@ async fn main() -> anyhow::Result<()> {
 
     for (video, video_name, progress_bar) in videos {
         let verbose = args.verbose;
-        let result: anyhow::Result<()> = async {
+        // The closure is immediately invoked; it exists only to scope `?` so
+        // a per-video failure can be given context and reported without
+        // aborting the loop over the remaining videos.
+        let result: anyhow::Result<()> = (|| {
             let srt = video.path.with_extension("srt");
-            if tokio::fs::try_exists(&srt)
-                .await
-                .context("check for existence")?
-            {
+            if srt.try_exists().context("check for existence")? {
                 if let Some(ref pb) = progress_bar {
                     pb.set_style(skipped_style.clone());
                     pb.set_prefix(video_name.clone());
@@ -1318,7 +1318,7 @@ async fn main() -> anyhow::Result<()> {
                     pb.set_message(msg);
                 }
 
-                let mut ffmpeg = tokio::process::Command::new("ffmpeg");
+                let mut ffmpeg = std::process::Command::new("ffmpeg");
 
                 // NOTE: we don't use -acodec copy because that would be limited to extracting time
                 // segments at block boundaries for the audio codec (e.g., blocks in AAC).
@@ -1365,15 +1365,14 @@ async fn main() -> anyhow::Result<()> {
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
-                    .kill_on_drop(true)
                     .spawn()
                     .context("ffmpeg split")?;
 
                 // A segment is at most tens of MB of PCM (16kHz mono f32 is
                 // ~3.8MB/min), so just buffer it all up; wait_with_output
-                // drains stdout and stderr concurrently, so this can't deadlock
-                // on a full pipe.
-                let ffmpeg = ffmpeg.wait_with_output().await.context("extract audio")?;
+                // drains stdout and stderr concurrently (on helper threads),
+                // so this can't deadlock on a full pipe.
+                let ffmpeg = ffmpeg.wait_with_output().context("extract audio")?;
                 if !ffmpeg.status.success() {
                     let ffmpeg_err = String::from_utf8_lossy(&ffmpeg.stderr);
                     return Err(anyhow::anyhow!("{ffmpeg_err}")).context("extract audio segment");
@@ -1483,10 +1482,9 @@ async fn main() -> anyhow::Result<()> {
                     pb.set_message(msg);
                 }
 
-                // Run inference synchronously right here, blocking the async
-                // runtime. That's fine — and not worth "fixing": nothing else
-                // needs to make progress during inference (the progress bars
-                // tick on their own thread).
+                // Inference blocks this thread for a while; that's fine —
+                // nothing else needs to make progress during it (the progress
+                // bars tick on their own thread).
                 let transcript = session
                     .run(&samples, &run_opts)
                     .context("transcribe audio segment")?;
@@ -1624,7 +1622,8 @@ async fn main() -> anyhow::Result<()> {
             // (progress messages quote it); the two-line wrapping happens
             // only here, at serialization, where a '\n' inside the text
             // block simply becomes the cue's second line.
-            let mut outfile = tokio::fs::File::create(&srt).await.context("create srt")?;
+            let outfile = std::fs::File::create(&srt).context("create srt")?;
+            let mut outfile = std::io::BufWriter::new(outfile);
             for (i, utterance) in captions.into_iter().enumerate() {
                 let line = format!(
                     "{}{}\n{} --> {}\n{}\n",
@@ -1636,18 +1635,16 @@ async fn main() -> anyhow::Result<()> {
                 );
                 outfile
                     .write_all(line.as_bytes())
-                    .await
                     .context("write out srt line")?;
             }
-            outfile.flush().await.context("flush srt")?;
+            outfile.flush().context("flush srt")?;
 
             // Mark as complete
             if let Some(ref pb) = progress_bar {
                 pb.finish_with_message("done");
             }
             Ok(())
-        }
-        .await;
+        })();
         result.with_context(|| format!("while transcribing {}", video_name))?;
     }
 
