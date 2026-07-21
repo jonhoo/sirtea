@@ -11,10 +11,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::units::Timestamp;
 use tokio::io::AsyncWriteExt;
 use transcribe_cpp::{disable_logging, init_backends_default, Model, RunOptions, TimestampKind};
 use walkdir::WalkDir;
@@ -974,9 +975,8 @@ async fn main() -> anyhow::Result<()> {
         hint.with_extension(ext);
         let meta_opts: MetadataOptions = Default::default();
         let fmt_opts: FormatOptions = Default::default();
-        let probed = match symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)
-        {
-            Ok(p) => p,
+        let format = match symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts) {
+            Ok(f) => f,
             Err(e) if explicit => {
                 anyhow::bail!("unsupported format for '{}': {}", path.display(), e);
             }
@@ -985,12 +985,12 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
-        let Some(track) = probed
-            .format
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.sample_rate.is_some())
-        else {
+        let Some(track) = format.tracks().iter().find(|t| {
+            t.codec_params
+                .as_ref()
+                .and_then(|cp| cp.audio())
+                .is_some_and(|a| a.sample_rate.is_some())
+        }) else {
             if !args.quiet {
                 eprintln!(
                     "warning: skipping '{}': no audio track found",
@@ -999,8 +999,26 @@ async fn main() -> anyhow::Result<()> {
             }
             continue;
         };
-        let (Some(time_base), Some(n_frames)) =
-            (track.codec_params.time_base, track.codec_params.n_frames)
+        // Containers that state a per-track length (e.g. isomp4) populate
+        // `Track::duration` (in `Track::time_base` ticks), while others
+        // (e.g. mkv) only state a whole-media length, surfaced via
+        // `FormatReader::media_info()` — so try the audio track first and
+        // fall back to the media-level info. The `Timestamp` conversion and
+        // the tick→time math are fallible only on overflow, which
+        // real-world durations never hit, so those failure modes just take
+        // the same "can't determine duration" skip path as missing
+        // metadata.
+        let Some(length) = track
+            .time_base
+            .zip(track.duration)
+            .or_else(|| {
+                let info = format.media_info();
+                info.time_base.zip(info.duration)
+            })
+            .and_then(|(time_base, ticks)| {
+                let ticks = Timestamp::try_from(ticks.get()).ok()?;
+                time_base.calc_time(ticks)
+            })
         else {
             if !args.quiet {
                 eprintln!(
@@ -1010,8 +1028,7 @@ async fn main() -> anyhow::Result<()> {
             }
             continue;
         };
-        let length = time_base.calc_time(n_frames);
-        let length = Duration::from_secs(length.seconds) + Duration::from_secs_f64(length.frac);
+        let length = Duration::from_secs_f64(length.as_secs_f64());
         // TODO: for whatever reason, track.codec_params.start_ts is always 0, so use ffprobe
         let delay = tokio::process::Command::new("ffprobe")
             .arg("-i")
