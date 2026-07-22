@@ -24,10 +24,6 @@ publish-jobs = ["homebrew"]
 # Currently: force a static MSVC CRT in the transcribe.cpp CMake build so it
 # matches dist's +crt-static Rust link — see the comment in that file.
 github-build-setup = "../build-setup.yml"
-# TEMPORARY (verification): run the full artifact builds on PRs so the
-# Windows link fix can be exercised without tagging a release. Remove (and
-# re-run `dist generate`) before merging.
-pr-run-mode = "upload"
 
 # Prebuilt binaries include the Vulkan GPU backend: ggml links it statically
 # (unlike the ONNX era's separate libwebgpu_dawn.so, which release installers
