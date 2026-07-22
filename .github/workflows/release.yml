@@ -140,6 +140,14 @@ jobs:
           Start-Process -FilePath $installer -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait -NoNewWindow
           Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=C:\VulkanSDK\$ver"
         shell: "pwsh"
+      - name: "Shim vulkan-1.lib for the link manifest (Windows)"
+        if: "runner.os == 'Windows'"
+        run: |
+          $shim = "$env:RUNNER_TEMP\vulkan-link-shim"
+          New-Item -ItemType Directory -Force -Path $shim | Out-Null
+          Copy-Item "$env:VULKAN_SDK\Lib\vulkan-1.lib" "$shim\vulkan.lib"
+          Add-Content -Path $env:GITHUB_ENV -Value "RUSTFLAGS=-Lnative=$shim"
+        shell: "pwsh"
       - uses: swatinem/rust-cache@v2
         with:
           key: ${{ join(matrix.targets, '-') }}
