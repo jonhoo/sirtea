@@ -27,12 +27,6 @@ publish-jobs = ["homebrew"]
 # provide glslc + Vulkan headers + vulkan-1.lib) — see the comments in that
 # file.
 github-build-setup = "../build-setup.yml"
-# Don't inject swatinem/rust-cache into the build jobs (dist does so by
-# default whenever pr-run-mode = "upload"): most of the build time here is
-# the C++/CMake tree in OUT_DIR plus a fresh Vulkan-shader build, which the
-# cargo-centric cache mostly misses, and stale native build dirs are exactly
-# the kind of thing we don't want a release-adjacent job resurrecting.
-cache-builds = false
 
 # Prebuilt binaries include the Vulkan GPU backend: ggml links it statically
 # (unlike the ONNX era's separate libwebgpu_dawn.so, which release installers
