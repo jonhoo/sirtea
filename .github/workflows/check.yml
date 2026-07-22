@@ -67,5 +67,10 @@ jobs:
       - name: Install Vulkan build dependencies
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libvulkan-dev spirv-headers glslc
+      # The always-on Windows Vulkan backend likewise needs the LunarG SDK
+      # (plus the CRT/link-shim bits releases use); the action self-gates on
+      # runner.os and is a no-op on the other matrix legs.
+      - name: Set up the Windows native build (CRT, Vulkan SDK, link shim)
+        uses: ./.github/actions/windows-native-setup
       - name: cargo check
         run: cargo check --locked --all-features --all-targets

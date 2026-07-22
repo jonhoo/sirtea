@@ -127,10 +127,8 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "Match the C++ CRT to cargo-dist's +crt-static (Windows)"
-        if: "runner.os == 'Windows'"
-        run: "echo 'TRANSCRIBE_CMAKE_ARGS=-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded' >> \"$GITHUB_ENV\""
-        shell: "bash"
+      - name: "Set up the Windows native build (CRT, Vulkan SDK, link shim)"
+        uses: "./.github/actions/windows-native-setup"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

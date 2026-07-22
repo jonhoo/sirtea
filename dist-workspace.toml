@@ -21,20 +21,28 @@ tap = "jonhoo/homebrew-tap"
 publish-jobs = ["homebrew"]
 # Extra steps for the build jobs (path relative to .github/workflows/; one
 # level up so GitHub doesn't parse the step list as a standalone workflow).
-# Currently: force a static MSVC CRT in the transcribe.cpp CMake build so it
-# matches dist's +crt-static Rust link — see the comment in that file.
+# Currently, both Windows-only: force a static MSVC CRT in the transcribe.cpp
+# CMake build so it matches dist's +crt-static Rust link, and install the
+# LunarG Vulkan SDK (dist's [dist.dependencies] has no Windows table that can
+# provide glslc + Vulkan headers + vulkan-1.lib) — see the comments in that
+# file.
 github-build-setup = "../build-setup.yml"
 
 # Prebuilt binaries include the Vulkan GPU backend: ggml links it statically
 # (unlike the ONNX era's separate libwebgpu_dawn.so, which release installers
 # could not ship), so the binaries stay self-contained. Building it needs the
-# Vulkan development bits on the CI runner, declared here.
+# Vulkan development bits on the CI runner: declared here for the Linux
+# builds; installed by ../build-setup.yml for the Windows build.
 #
 # NOTE: unverified until the first release CI run:
 # - whether a Vulkan-enabled binary starts on a machine *without*
 #   libvulkan.so.1 installed (ggml is expected to fall back to CPU; if the
 #   dynamic loader dependency turns out to be hard, revisit with
-#   transcribe-cpp's `dynamic-backends` feature or a CPU-only artifact);
+#   transcribe-cpp's `dynamic-backends` feature or a CPU-only artifact).
+#   On Windows the equivalent dependency is vulkan-1.dll, and there it is
+#   *known* to be load-time-hard (the exe links vulkan-1.lib); accepted
+#   because GPU drivers install the loader on effectively every desktop and
+#   laptop — see the comment in Cargo.toml;
 # - the aarch64 build (runs on GitHub's native arm runners, so no
 #   cross-compiling of the C++ core is involved — but it has never been
 #   exercised).
