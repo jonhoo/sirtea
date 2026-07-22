@@ -127,31 +127,8 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "Match the C++ CRT to cargo-dist's +crt-static (Windows)"
-        if: "runner.os == 'Windows'"
-        run: "echo 'TRANSCRIBE_CMAKE_ARGS=-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded' >> \"$GITHUB_ENV\""
-        shell: "bash"
-      - name: "Install the Vulkan SDK (Windows)"
-        if: "runner.os == 'Windows'"
-        run: |
-          $ver = "1.4.350.0"
-          $installer = "$env:RUNNER_TEMP\vulkan-sdk.exe"
-          curl.exe -sSfL -o $installer "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
-          Start-Process -FilePath $installer -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait -NoNewWindow
-          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=C:\VulkanSDK\$ver"
-        shell: "pwsh"
-      - name: "Shim vulkan-1.lib for the link manifest (Windows)"
-        if: "runner.os == 'Windows'"
-        run: |
-          $shim = "$env:RUNNER_TEMP\vulkan-link-shim"
-          New-Item -ItemType Directory -Force -Path $shim | Out-Null
-          Copy-Item "$env:VULKAN_SDK\Lib\vulkan-1.lib" "$shim\vulkan.lib"
-          Add-Content -Path $env:GITHUB_ENV -Value "RUSTFLAGS=-Lnative=$shim"
-        shell: "pwsh"
-      - uses: swatinem/rust-cache@v2
-        with:
-          key: ${{ join(matrix.targets, '-') }}
-          cache-provider: ${{ matrix.cache_provider }}
+      - name: "Set up the Windows native build (CRT, Vulkan SDK, link shim)"
+        uses: "./.github/actions/windows-native-setup"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
