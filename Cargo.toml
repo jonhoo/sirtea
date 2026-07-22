@@ -29,13 +29,23 @@ ureq = { version = "3.3.0", features = ["platform-verifier"] }
 walkdir = "2.5.0"
 
 # ggml GPU backends are compile-time choices, and the natural one differs per
-# OS: Vulkan on Linux (statically linked into the binary — no shared-library
-# shipping problem — but needs the Vulkan SDK + glslc at build time), Metal
-# on macOS. Machines without a usable GPU fall back to CPU at runtime, so
-# there is no CPU-only build variant.
-# TODO: Windows GPU (Vulkan should work there too; untested) — CPU-only for
-# now.
+# OS: Vulkan on Linux and Windows (statically linked into the binary — no
+# shared-library shipping problem — but needs the Vulkan SDK + glslc at build
+# time), Metal on macOS. Machines without a usable GPU fall back to CPU at
+# runtime, so there is no CPU-only build variant.
+#
+# On Windows, the Vulkan backend links the loader's import library
+# (vulkan-1.lib), so the resulting exe has a *load-time* dependency on
+# vulkan-1.dll — if it is missing, the binary fails to start rather than
+# falling back to CPU. Accepted: the loader ships with every NVIDIA/AMD/Intel
+# GPU driver, so effectively all desktops and laptops have it; the machines
+# that don't (clean VMs before driver install, headless servers) are not this
+# tool's audience. This mirrors the libvulkan.so.1 situation on Linux noted
+# in dist-workspace.toml.
 [target.'cfg(target_os = "linux")'.dependencies]
+transcribe-cpp = { version = "0.1.1", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
 transcribe-cpp = { version = "0.1.1", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

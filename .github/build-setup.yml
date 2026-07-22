@@ -25,3 +25,29 @@
   if: runner.os == 'Windows'
   shell: bash
   run: echo 'TRANSCRIBE_CMAKE_ARGS=-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded' >> "$GITHUB_ENV"
+
+# Windows: install the Vulkan SDK so the ggml Vulkan backend can build.
+# ggml does `find_package(Vulkan COMPONENTS glslc REQUIRED)`, which needs
+# the headers, the loader import library (vulkan-1.lib), and the glslc
+# shader compiler — all of which only the full LunarG SDK provides on
+# Windows. dist's [dist.dependencies] tables have no good Windows
+# equivalent for this (chocolatey's vulkan-sdk package is
+# community-maintained and lags), so we install a pinned LunarG release
+# directly. CMake's FindVulkan locates everything through the VULKAN_SDK
+# env var, which must be exported explicitly: the installer only sets a
+# machine-level env var, which steps already running in this job never
+# see.
+#
+# The version is pinned (rather than LunarG's "latest" alias) so release
+# builds are reproducible and don't break when LunarG ships a new SDK.
+# The default install includes everything we need; no optional components
+# are requested.
+- name: Install the Vulkan SDK (Windows)
+  if: runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ver = "1.4.350.0"
+    $installer = "$env:RUNNER_TEMP\vulkan-sdk.exe"
+    curl.exe -sSfL -o $installer "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
+    Start-Process -FilePath $installer -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait -NoNewWindow
+    Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=C:\VulkanSDK\$ver"
