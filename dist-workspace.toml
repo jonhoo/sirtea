@@ -19,6 +19,11 @@ install-updater = false
 tap = "jonhoo/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+# Extra steps for the build jobs (path relative to .github/workflows/; one
+# level up so GitHub doesn't parse the step list as a standalone workflow).
+# Currently: force a static MSVC CRT in the transcribe.cpp CMake build so it
+# matches dist's +crt-static Rust link — see the comment in that file.
+github-build-setup = "../build-setup.yml"
 
 # Prebuilt binaries include the Vulkan GPU backend: ggml links it statically
 # (unlike the ONNX era's separate libwebgpu_dawn.so, which release installers
