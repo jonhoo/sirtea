@@ -1,0 +1,91 @@
+# Keep the pinned LunarG Vulkan SDK (used by the Windows release/check
+# builds via .github/actions/windows-native-setup) from going stale: once a
+# month, compare the pin against LunarG's latest Windows SDK and open (or
+# refresh) a PR bumping it. Dependabot can't do this — it has no custom
+# datasource support — and the pin lives in a composite action, not a
+# manifest any updater understands.
+#
+# Two GitHub facts worth knowing here:
+# - PRs created with the default GITHUB_TOKEN do NOT trigger `on:
+#   pull_request` workflows (recursion guard), so the bump PR initially
+#   shows no checks. Close and reopen it (or push any commit to it) to make
+#   check.yml and the release plan run — which is the real validation,
+#   since check.yml's Windows leg exercises the new SDK install. If this
+#   gets annoying, swap `github.token` below for a PAT with repo scope.
+# - GitHub disables cron workflows after 60 days without repo activity;
+#   the workflow_dispatch trigger is the manual override.
+name: vulkan-sdk-update
+permissions:
+  contents: write
+  pull-requests: write
+on:
+  schedule:
+    # Monthly; LunarG ships roughly 4-6 SDKs a year, so anything more
+    # frequent would mostly be no-ops.
+    - cron: '19 7 3 * *'
+  workflow_dispatch:
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # tag=v6.0.1
+      - name: Bump the pin and open/update a PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          action_file=".github/actions/windows-native-setup/action.yml"
+          branch="auto/vulkan-sdk-update"
+
+          latest="$(curl -sSf https://vulkan.lunarg.com/sdk/latest/windows.txt)"
+          # Sanity-check the response shape so an HTML error page or an API
+          # change can't sed garbage into the action file.
+          if [[ ! "$latest" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+            echo "::error::unexpected version string from LunarG: '$latest'"
+            exit 1
+          fi
+
+          # shellcheck disable=SC2016 # the $ver is a literal (PowerShell variable in the action file), not a shell expansion
+          pinned="$(grep -oP '\$ver = "\K[0-9.]+(?=")' "$action_file")"
+          echo "pinned: $pinned; latest: $latest"
+          if [[ "$pinned" == "$latest" ]]; then
+            echo "pin is current; nothing to do"
+            exit 0
+          fi
+
+          # If an update branch already proposing $latest exists, leave it
+          # alone: force-pushing an identical bump would clobber any manual
+          # commits someone added to the PR and spam its timeline.
+          if git fetch origin "$branch" 2>/dev/null; then
+            if git show "origin/$branch:$action_file" | grep -qF "\$ver = \"$latest\""; then
+              echo "existing $branch already proposes $latest; leaving it untouched"
+              exit 0
+            fi
+          fi
+
+          sed -i "s/\$ver = \"$pinned\"/\$ver = \"$latest\"/" "$action_file"
+          if git diff --quiet; then
+            echo "::error::expected to update $action_file but nothing changed"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git commit -am "chore: bump the pinned LunarG Vulkan SDK to $latest"
+          git push -f origin "$branch"
+
+          title="chore: bump the pinned LunarG Vulkan SDK to $latest"
+          body="Automated bump of the LunarG Vulkan SDK pin in \`$action_file\` from $pinned to $latest (source: <https://vulkan.lunarg.com/sdk/latest/windows.txt>).
+
+          > [!NOTE]
+          > PRs opened with the default \`GITHUB_TOKEN\` do not trigger CI. Close and reopen this PR (or push to it) to run the checks — check.yml's Windows leg is what actually validates the new SDK."
+          pr="$(gh pr list --head "$branch" --state open --json number --jq '.[].number')"
+          if [[ -z "$pr" ]]; then
+            gh pr create --head "$branch" --title "$title" --body "$body"
+          else
+            # The push above already updated the PR's diff; refresh the text
+            # so the title names the version it now proposes.
+            gh pr edit "$pr" --title "$title" --body "$body"
+          fi
