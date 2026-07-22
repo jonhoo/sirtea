@@ -6,7 +6,6 @@
 
 use anyhow::Context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -263,12 +262,7 @@ REQUIREMENTS:
     );
 }
 
-// deny_unknown_fields is deliberate: it turns config keys from the Gladia-based
-// versions of this tool (gladia_api_key, max_cost, parallel) into a clear parse
-// error naming the config file, instead of silently ignoring settings the user
-// believes are in effect.
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 struct Config {
     // Optional settings that can be overridden by CLI flags
     model_path: Option<PathBuf>,
@@ -306,8 +300,58 @@ fn load_config() -> anyhow::Result<Config> {
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)
                 .with_context(|| format!("read config from '{}'", config_path.display()))?;
-            config = toml::from_str(&contents)
+            config = parse_config(&contents)
                 .with_context(|| format!("parse config from '{}'", config_path.display()))?;
+        }
+    }
+
+    Ok(config)
+}
+
+/// Parse the config file contents.
+///
+/// This walks the parsed TOML document by hand (via serde-free
+/// `toml::de::DeTable`) rather than deriving `serde::Deserialize`: the config
+/// has exactly two scalar keys, and dropping the derive keeps serde out of the
+/// dependency tree entirely.
+///
+/// Rejecting unknown keys is deliberate: it turns config keys from the
+/// Gladia-based versions of this tool (gladia_api_key, max_cost, parallel)
+/// into a clear parse error naming the config file, instead of silently
+/// ignoring settings the user believes are in effect.
+fn parse_config(contents: &str) -> anyhow::Result<Config> {
+    let table = toml::de::DeTable::parse(contents).context("parse TOML")?;
+
+    let mut config = Config::default();
+    for (key, value) in table.get_ref() {
+        let value = value.get_ref();
+        match key.get_ref().as_ref() {
+            "model_path" => {
+                let path = value.as_str().with_context(|| {
+                    format!("interpret model_path (must be a string): {value:?}")
+                })?;
+                config.model_path = Some(PathBuf::from(path));
+            }
+            "segment_length" => {
+                // Accept both TOML floats and integers, like serde's f64
+                // deserialization used to: existing configs may well say
+                // `segment_length = 180` rather than `180.0`.
+                let secs = if let Some(f) = value.as_float() {
+                    f.as_str()
+                        .parse::<f64>()
+                        .with_context(|| format!("interpret segment_length as a number: {f}"))?
+                } else if let Some(i) = value.as_integer() {
+                    i64::from_str_radix(i.as_str(), i.radix())
+                        .with_context(|| format!("interpret segment_length as a number: {i}"))?
+                        as f64
+                } else {
+                    anyhow::bail!("interpret segment_length (must be a number): {value:?}");
+                };
+                config.segment_length = Some(secs);
+            }
+            other => {
+                anyhow::bail!("unrecognized config key '{other}'");
+            }
         }
     }
 
@@ -1789,6 +1833,60 @@ mod tests {
     #[test]
     fn pcm_empty() {
         assert_eq!(pcm_f32le_to_samples(&[]).unwrap(), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn config_empty() {
+        let config = parse_config("").unwrap();
+        assert_eq!(config.model_path, None);
+        assert_eq!(config.segment_length, None);
+    }
+
+    #[test]
+    fn config_all_keys() {
+        let config = parse_config(
+            r#"
+            # settings for sirtea
+            model_path = "/models/parakeet.gguf"
+
+            segment_length = 120.5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.model_path.as_deref(),
+            Some(Path::new("/models/parakeet.gguf"))
+        );
+        assert_eq!(config.segment_length, Some(120.5));
+    }
+
+    #[test]
+    fn config_integer_segment_length() {
+        // serde deserialized TOML integers into the f64 field; existing
+        // configs saying `segment_length = 180` must keep working.
+        let config = parse_config("segment_length = 180").unwrap();
+        assert_eq!(config.segment_length, Some(180.0));
+    }
+
+    #[test]
+    fn config_unknown_key_rejected() {
+        // Keys from the Gladia-era config must produce an error, not be
+        // silently ignored.
+        let err = parse_config(r#"gladia_api_key = "sk-123""#).unwrap_err();
+        assert!(err.to_string().contains("gladia_api_key"), "{err:?}");
+    }
+
+    #[test]
+    fn config_wrong_type_rejected() {
+        let err = parse_config("model_path = 42").unwrap_err();
+        assert!(format!("{err:?}").contains("model_path"), "{err:?}");
+        let err = parse_config(r#"segment_length = "long""#).unwrap_err();
+        assert!(format!("{err:?}").contains("segment_length"), "{err:?}");
+    }
+
+    #[test]
+    fn config_invalid_toml_rejected() {
+        assert!(parse_config("model_path = ").is_err());
     }
 
     #[test]
