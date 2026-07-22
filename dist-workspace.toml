@@ -27,10 +27,6 @@ publish-jobs = ["homebrew"]
 # provide glslc + Vulkan headers + vulkan-1.lib) — see the comments in that
 # file.
 github-build-setup = "../build-setup.yml"
-# TEMPORARY (verification): run the full artifact builds on PRs so the
-# Windows Vulkan build can be exercised without tagging a release. Remove
-# (and re-run `dist generate`) before merging.
-pr-run-mode = "upload"
 # Don't inject swatinem/rust-cache into the build jobs (dist does so by
 # default whenever pr-run-mode = "upload"): most of the build time here is
 # the C++/CMake tree in OUT_DIR plus a fresh Vulkan-shader build, which the
