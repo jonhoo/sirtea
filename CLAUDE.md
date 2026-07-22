@@ -40,7 +40,7 @@ containing the default one).
 
 ## Architecture
 
-Single-file async Rust application (`src/main.rs`) that:
+Single-file Rust application (`src/main.rs`) that:
 
 1. **Discovers files** - Accepts video files or directories; recurses directories with `walkdir`
 2. **Probes media** - Uses `symphonia` to read audio track metadata (duration, sample rate)
