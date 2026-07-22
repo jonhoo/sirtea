@@ -1,0 +1,27 @@
+# Extra steps injected into dist's build-local-artifacts job via the
+# `github-build-setup` setting in dist-workspace.toml.
+#
+# Windows: match the C++ core's CRT to the Rust link. dist builds MSVC
+# targets with RUSTFLAGS=-Ctarget-feature=+crt-static (its default
+# `msvc-crt-static = true`), so rustc links the *static* CRT — the right
+# posture for a self-contained CLI (no vcruntime140.dll / VC++ redist
+# dependency on end-user machines). But transcribe-cpp-sys's CMake build
+# ends up compiling /MD (dynamic CRT): cmake-rs only communicates the CRT
+# choice through legacy /MT compiler flags, and transcribe.cpp requires
+# CMake >= 3.16, where policy CMP0091 (NEW) selects the runtime from
+# CMAKE_MSVC_RUNTIME_LIBRARY instead — defaulting to MultiThreadedDLL.
+# Mixing /MD objects into a static-CRT link fails with LNK2019 on ~15
+# __imp_* CRT symbols (see run 29873034156 for release 0.2.1).
+#
+# Setting the CMP0091-authoritative variable through the -sys crate's
+# TRANSCRIBE_CMAKE_ARGS escape hatch forces /MT throughout the C++ tree
+# (inherited by the vendored ggml subdirectory). Plain "MultiThreaded"
+# (not the $<CONFIG:Debug> generator expression) suffices because the
+# -sys build script always configures a Release build.
+#
+# TODO: drop this if transcribe-cpp-sys learns to derive
+# CMAKE_MSVC_RUNTIME_LIBRARY from crt-static in CARGO_CFG_TARGET_FEATURE.
+- name: Match the C++ CRT to cargo-dist's +crt-static (Windows)
+  if: runner.os == 'Windows'
+  shell: bash
+  run: echo 'TRANSCRIBE_CMAKE_ARGS=-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded' >> "$GITHUB_ENV"
