@@ -21,7 +21,6 @@ jobs:
       # The always-on Linux Vulkan backend needs these to build; keep in sync
       # with [dist.dependencies.apt] in dist-workspace.toml.
       - name: Install Vulkan build dependencies
-        if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libvulkan-dev spirv-headers glslc
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # tag=v6.0.2
         with:
