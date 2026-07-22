@@ -8,6 +8,7 @@ use anyhow::Context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -16,7 +17,6 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Timestamp;
-use std::io::Write;
 use transcribe_cpp::{disable_logging, init_backends_default, Model, RunOptions, TimestampKind};
 use walkdir::WalkDir;
 
