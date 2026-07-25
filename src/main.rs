@@ -157,6 +157,8 @@ struct Args {
     quiet: bool,
     verbose: bool,
     one_file_system: bool,
+    output_dir: Option<PathBuf>,
+    overwrite: bool,
 }
 
 fn parse_args() -> Result<Args, lexopt::Error> {
@@ -169,6 +171,8 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     let mut quiet = false;
     let mut verbose = false;
     let mut one_file_system = false;
+    let mut output_dir = None;
+    let mut overwrite = false;
 
     let mut parser = lexopt::Parser::from_env();
     while let Some(arg) = parser.next()? {
@@ -180,6 +184,12 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Short('V') | Long("version") => {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
+            }
+            Short('o') | Long("output") => {
+                output_dir = Some(PathBuf::from(parser.value()?));
+            }
+            Long("overwrite") => {
+                overwrite = true;
             }
             Long("model") => {
                 model = Some(PathBuf::from(parser.value()?));
@@ -214,6 +224,8 @@ fn parse_args() -> Result<Args, lexopt::Error> {
         quiet,
         verbose,
         one_file_system,
+        output_dir,
+        overwrite,
     })
 }
 
@@ -236,6 +248,9 @@ ARGS:
 OPTIONS:
     -h, --help                  Print help information
     -V, --version               Print version information
+    -o, --output <DIR>          Write SRT files to this directory (default: alongside
+                                each input file)
+        --overwrite             Overwrite existing files (default: skip)
         --model <FILE>          Path to the Parakeet GGUF model file, or a
                                 directory containing {model_file}
                                 (default: auto-download to the user data dir)
@@ -498,7 +513,6 @@ fn download_model(target: &Path, quiet: bool) -> anyhow::Result<()> {
     if let Some(pb) = progress_bar {
         pb.finish();
     }
-
     std::fs::rename(&tmp, target).context("move completed model download into place")?;
     Ok(())
 }
@@ -965,6 +979,19 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("no video files specified. Run with --help for usage.");
     }
 
+    if let Some(ref output_dir) = args.output_dir {
+        if !output_dir.exists() {
+            std::fs::create_dir_all(output_dir)
+                .with_context(|| format!("create output directory '{}'", output_dir.display()))?;
+        }
+        if !output_dir.is_dir() {
+            anyhow::bail!(
+                "output path '{}' exists but is not a directory",
+                output_dir.display()
+            );
+        }
+    }
+
     // Check for required external tools
     check_external_tool("ffmpeg")?;
     check_external_tool("ffprobe")?;
@@ -1292,8 +1319,15 @@ fn main() -> anyhow::Result<()> {
         // a per-video failure can be given context and reported without
         // aborting the loop over the remaining videos.
         let result: anyhow::Result<()> = (|| {
-            let srt = video.path.with_extension("srt");
-            if srt.try_exists().context("check for existence")? {
+            let srt = if let Some(ref output_dir) = args.output_dir {
+                let basename = video.path.file_name().unwrap_or_default();
+                // NOTE: file_name theoretically returns None, but this is handled above
+                // when checking the extensions for candidate paths
+                output_dir.join(basename).with_extension("srt")
+            } else {
+                video.path.with_extension("srt")
+            };
+            if !args.overwrite && srt.try_exists().context("check for existence")? {
                 if let Some(ref pb) = progress_bar {
                     pb.set_style(skipped_style.clone());
                     pb.set_prefix(video_name.clone());
