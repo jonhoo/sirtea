@@ -576,24 +576,23 @@ fn ends_sentence(word: &str, next: Option<&str>) -> bool {
 /// (see `FUNCTION_WORD_BREAK_PENALTY`).
 fn is_function_word(word: &str) -> bool {
     let word = word.trim_end_matches(|c: char| !c.is_alphanumeric());
-    let lower = word.to_lowercase();
-    matches!(
-        lower.as_str(),
-        "the" | "a" | "an" // articles
-        | "and" | "or" | "but" | "nor" | "so" | "yet" // conjunctions
-        | "to" | "of" | "in" | "on" | "at" | "by" | "for" | "with" | "from"
-        | "into" | "onto" | "about" | "over" | "under" | "between" // prepositions
-        | "as" | "if" | "that" | "which" | "who" | "whose" | "whom"
-        | "what" | "when" | "where" | "how" | "why" | "because" // subordinators
-        | "is" | "are" | "was" | "were" | "be" | "been" | "being" | "am"
-        | "do" | "does" | "did" | "will" | "would" | "can" | "could"
-        | "should" | "shall" | "may" | "might" | "must" // auxiliaries
-        | "i" | "we" | "you" | "he" | "she" | "it" | "they"
-        | "my" | "our" | "your" | "his" | "her" | "its" | "their" // pronouns
-        | "this" | "these" | "those"
-        | "not" | "no" | "very" | "really" | "just" | "quite"
-        | "some" | "any" | "each" | "every" // determiners/intensifiers
-    )
+    const NO_BREAK_MATCHES: [&str; 84] = [
+        "the", "a", "an", // articles
+        "and", "or", "but", "nor", "so", "yet", // conjunctions
+        "to", "of", "in", "on", "at", "by", "for", "with", "from", "into", "onto", "about", "over",
+        "under", "between", // prepositions
+        "as", "if", "that", "which", "who", "whose", "whom", "what", "when", "where", "how", "why",
+        "because", // subordinators
+        "is", "are", "was", "were", "be", "been", "being", "am", "do", "does", "did", "will",
+        "would", "can", "could", "should", "shall", "may", "might", "must", // auxiliaries
+        "i", "we", "you", "he", "she", "it", "they", "my", "our", "your", "his", "her", "its",
+        "their", // pronouns
+        "this", "these", "those", "not", "no", "very", "really", "just", "quite", "some", "any",
+        "each", "every", // determiners/intensifiers
+    ];
+    NO_BREAK_MATCHES
+        .iter()
+        .any(|w| w.eq_ignore_ascii_case(word))
 }
 
 /// The cost of ending a cue after `word`, mid-sentence, where `next_start`
