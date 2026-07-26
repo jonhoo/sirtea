@@ -1,6 +1,7 @@
 /target
 /config.toml
 *.srt
+*.vtt
 *.mkv
 *.mp4
 *.mka

@@ -1,4 +1,3 @@
-// TODO: Add --srt / --vtt format selection (currently only SRT is supported)
 // NOTE: captions are verbatim by design (fillers, stutters, and all), and
 // that's intentional and permanent: transcript cleanup changes what was said
 // and will not be added here. The README points users at post-processing
@@ -7,7 +6,6 @@
 use anyhow::Context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -18,6 +16,9 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Timestamp;
 use transcribe_cpp::{disable_logging, init_backends_default, Model, RunOptions, TimestampKind};
 use walkdir::WalkDir;
+
+mod subtitle_formats;
+use subtitle_formats::SubtitleFormat;
 
 // Long videos are split into segments and the transcripts stitched back
 // together at natural sentence boundaries (see the split-point logic in
@@ -151,6 +152,7 @@ const MODEL_FILE: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
 struct Args {
     files: Vec<PathBuf>,
     /// None means "not explicitly set on command line"
+    subtitle_format: SubtitleFormat,
     model: Option<PathBuf>,
     segment_length: Option<f64>,
     dry_run: bool,
@@ -163,6 +165,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     use lexopt::prelude::*;
 
     let mut files = Vec::new();
+    let mut subtitle_format = SubtitleFormat::Srt;
     let mut model = None;
     let mut segment_length = None;
     let mut dry_run = false;
@@ -180,6 +183,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Short('V') | Long("version") => {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
+            }
+            Long("format") => {
+                subtitle_format = parser.value()?.parse()?;
             }
             Long("model") => {
                 model = Some(PathBuf::from(parser.value()?));
@@ -208,6 +214,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 
     Ok(Args {
         files,
+        subtitle_format,
         model,
         segment_length,
         dry_run,
@@ -236,6 +243,8 @@ ARGS:
 OPTIONS:
     -h, --help                  Print help information
     -V, --version               Print version information
+        --format <FORMAT>       Subtitle format to write (default: srt)
+                                currently supported: srt, vtt
         --model <FILE>          Path to the Parakeet GGUF model file, or a
                                 directory containing {model_file}
                                 (default: auto-download to the user data dir)
@@ -1292,8 +1301,8 @@ fn main() -> anyhow::Result<()> {
         // a per-video failure can be given context and reported without
         // aborting the loop over the remaining videos.
         let result: anyhow::Result<()> = (|| {
-            let srt = video.path.with_extension("srt");
-            if srt.try_exists().context("check for existence")? {
+            let subtitle_file = video.path.with_extension(args.subtitle_format.extension());
+            if subtitle_file.try_exists().context("check for existence")? {
                 if let Some(ref pb) = progress_bar {
                     pb.set_style(skipped_style.clone());
                     pb.set_prefix(video_name.clone());
@@ -1442,7 +1451,7 @@ fn main() -> anyhow::Result<()> {
                             video_name,
                             extracted_secs,
                             limit,
-                            format_srt_timestamp(start_f64),
+                            args.subtitle_format.format_timestamp(start_f64),
                         );
                     }
                 }
@@ -1486,8 +1495,9 @@ fn main() -> anyhow::Result<()> {
                             eprintln!(
                                 "{}: leading silence at {}, skipping to {}",
                                 video_name,
-                                format_srt_timestamp(start_f64),
-                                format_srt_timestamp(start_f64 + resume_secs),
+                                args.subtitle_format.format_timestamp(start_f64),
+                                args.subtitle_format
+                                    .format_timestamp(start_f64 + resume_secs),
                             );
                         }
                         start += Duration::from_secs_f64(resume_secs);
@@ -1499,8 +1509,11 @@ fn main() -> anyhow::Result<()> {
                         eprintln!(
                             "{}: re-anchoring at silence [{} .. {}]",
                             video_name,
-                            format_srt_timestamp(start_f64 + sil_start as f64 / SAMPLE_RATE as f64),
-                            format_srt_timestamp(start_f64 + sil_end as f64 / SAMPLE_RATE as f64),
+                            args.subtitle_format.format_timestamp(
+                                start_f64 + sil_start as f64 / SAMPLE_RATE as f64
+                            ),
+                            args.subtitle_format
+                                .format_timestamp(start_f64 + sil_end as f64 / SAMPLE_RATE as f64),
                         );
                     }
                     // Keep a hair of the silence after the last word so it
@@ -1572,8 +1585,9 @@ fn main() -> anyhow::Result<()> {
                         eprintln!(
                             "{}: silent segment at {}, skipping to {}",
                             video_name,
-                            format_srt_timestamp(start.as_secs_f64()),
-                            format_srt_timestamp(start.as_secs_f64() + consumed),
+                            args.subtitle_format.format_timestamp(start.as_secs_f64()),
+                            args.subtitle_format
+                                .format_timestamp(start.as_secs_f64() + consumed),
                         );
                     }
                     start += Duration::from_secs_f64(consumed);
@@ -1626,7 +1640,8 @@ fn main() -> anyhow::Result<()> {
                         eprintln!(
                             "{}: split at {} (after '{}')",
                             video_name,
-                            format_srt_timestamp(slice_at.as_secs_f64()),
+                            args.subtitle_format
+                                .format_timestamp(slice_at.as_secs_f64()),
                             utterances[split_idx].text,
                         );
                     }
@@ -1662,27 +1677,11 @@ fn main() -> anyhow::Result<()> {
                 "transcription produced no captions for the entire video; is the audio silent?"
             );
 
-            // Write the SRT file. Cue text is kept single-line internally
-            // (progress messages quote it); the two-line wrapping happens
-            // only here, at serialization, where a '\n' inside the text
-            // block simply becomes the cue's second line.
-            let outfile = std::fs::File::create(&srt).context("create srt")?;
+            let outfile = std::fs::File::create(subtitle_file).context("create subtitle file")?;
             let mut outfile = std::io::BufWriter::new(outfile);
-            for (i, utterance) in captions.into_iter().enumerate() {
-                let line = format!(
-                    "{}{}\n{} --> {}\n{}\n",
-                    if i != 0 { "\n" } else { "" },
-                    i + 1,
-                    format_srt_timestamp(utterance.start),
-                    format_srt_timestamp(utterance.end),
-                    balance_lines(&utterance.text),
-                );
-                outfile
-                    .write_all(line.as_bytes())
-                    .context("write out srt line")?;
-            }
-            outfile.flush().context("flush srt")?;
-
+            args.subtitle_format
+                .write_out(&captions, &mut outfile)
+                .context("write subtitle file")?;
             // Mark as complete
             if let Some(ref pb) = progress_bar {
                 pb.finish_with_message("done");
@@ -1699,49 +1698,9 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn format_srt_timestamp(total_seconds: f64) -> String {
-    // Negative timestamps should never occur - they would indicate a bug
-    // in our timestamp calculation logic
-    let mut remaining_secs = total_seconds as i64;
-    debug_assert!(remaining_secs >= 0, "negative timestamp: {total_seconds}");
-    remaining_secs = remaining_secs.max(0); // Saturate to 0 in release builds rather than panic
-    let h = remaining_secs / 3600;
-    remaining_secs -= h * 3600;
-    let m = remaining_secs / 60;
-    remaining_secs -= m * 60;
-    let s = remaining_secs;
-    let millis_str = total_seconds.fract();
-    let millis_str = format!("{:.3}", millis_str);
-    let millis_str = if let Some(millis) = millis_str.strip_prefix("0.") {
-        format!(",{millis}")
-    } else if millis_str == "1.000" {
-        // 0.9995 would be truncated to 1.000 at {:.3}
-        String::from(",999")
-    } else if millis_str == "0" {
-        // integral number of seconds
-        String::from(",000")
-    } else {
-        unreachable!(
-            "bad fractional second: {} -> {millis_str}",
-            total_seconds.fract()
-        )
-    };
-    format!("{h:02}:{m:02}:{s:02}{millis_str}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn all_ones() {
-        assert!(dbg!(format_srt_timestamp(3661.3)).starts_with("01:01:01,3"));
-    }
-
-    #[test]
-    fn zero_fract() {
-        assert_eq!(format_srt_timestamp(3661.0), "01:01:01,000");
-    }
 
     /// `find_long_silence` fixtures: "loud" is sine-ish full-scale noise,
     /// "quiet" is well under the -45 dBFS threshold. Durations in seconds.
