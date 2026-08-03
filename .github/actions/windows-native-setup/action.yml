@@ -57,7 +57,7 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        $ver = "1.4.350.0"
+        $ver = "1.4.357.0"
         $installer = "$env:RUNNER_TEMP\vulkan-sdk.exe"
         curl.exe -sSfL -o $installer "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
         Start-Process -FilePath $installer -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait -NoNewWindow
